@@ -1,0 +1,27 @@
+use this @decomm_fix.py as reference and fix the issue mentioned below for intel server as provided below, Analyze the existing logic and it should cover retry from new to old till it get success.
+Don't make api or network call as from this system we will not be able to verify it out in real time
+
+Step #,Step,Status,Details
+1,VMware Validation (whatif),SUCCESS,-
+2,RFC Creation,SUCCESS,rfc_number: CHG017852257
+3,CI Update (ITSM),SUCCESS,-
+4,RFC Scheduling,SUCCESS,rfc_number: CHG017852257
+5,RFC Status Check (Implement),SUCCESS,rfc_number: CHG017852257
+6,Icinga ESXi Blackout Schedule,SUCCESS,-
+7,Icinga Monitoring Disable,SUCCESS,-
+8,VMware Decommission (Execute),SUCCESS,-
+8.1,Post-Decom Validation,SUCCESS,-
+8.2,Cluster Icinga Blackout (if last host),NOT_STARTED,-
+8.3,Cluster Icinga Disable (if last host),NOT_STARTED,-
+8.4,Cluster vCenter Delete (if last host),NOT_STARTED,-
+9,Active Directory Cleanup,SUCCESS,-
+10,IDC Physical Record Update,SKIPPED,reason: Serial number not found in IDC
+11,Server Shutdown (Redfish),SUCCESS,message: Server shutdown initiated successfully using GracefulShutdown
+11.1,ILO A-Record Check/Rename (serial-ilo),FAILED,error: IloIPReconfig 5b18ddf2-c632-4bfb-88cc-34073eb413e8 did not complete within 1800s (last status: in progress)
+12,DNS CNAME Delete (ILO),SUCCESS,-
+13,DNS A Record Delete (Host),SUCCESS,-
+15,Mojo Serial Check,FAILED,error: Could not check serial in Mojo: Mojo check failed: Mojo Check API call failed with status 500: {'error': 'Failed to check serials in Mojo: Failed to get environments for vCenter sddc2q1linfvs01.phx.aexp.com : No data found : []'}
+16,Mojo Decommission,SKIPPED,reason: Mojo check failed
+16.1,Mojo Power State Check/Off,FAILED,error: Mojo check failed: Mojo Check API call failed with status 500: {'error': 'Failed to check serials in Mojo: Failed to get environments for vCenter sddc2q1linfvs01.phx.aexp.com : No data found : []'}
+17,Server Power-Off Validation (Redfish),FAILED,"error: Failed to login with any available credentials from vault. Last error: HTTPSConnectionPool(host='10.XX.16.XXX', port=443): Max retries exceeded with url: /redfish/v1/SessionService/Sessions (Caused by ConnectTimeoutError(<urllib3.connection.HTTPSConnection object at 0x7f1f5d895890>, 'Connection to 10.62.16.158 timed out. (connect timeout=30)'))"
+18,RFC Closure,SUCCESS,rfc_number: CHG017852257

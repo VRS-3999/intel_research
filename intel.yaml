@@ -1,0 +1,102 @@
+vendor: intel
+default_version: openbmc_current
+versions:
+  # Current Intel Server System OpenBMC firmware, matching the endpoints
+  # documented in the Intel Server System Integrated BMC Firmware OpenBMC
+  # Redfish API Specification (Rev 1.3, April 2024).
+  openbmc_current:
+    endpoints:
+      session_path: /redfish/v1/SessionService/Sessions
+      system_path: /redfish/v1/Systems/system
+      manager_path: /redfish/v1/Managers/bmc
+      chassis_path: /redfish/v1/Chassis/Baseboard
+      ethernet_interface_path: /redfish/v1/Managers/bmc/EthernetInterfaces/eth0
+      network_protocol_path: /redfish/v1/Managers/bmc/NetworkProtocol
+      boot_status_path: /redfish/v1/Systems/system/
+      lifecycle_log_path: /redfish/v1/Systems/system/LogServices/EventLog/Entries
+      virtual_media_path: /redfish/v1/Managers/bmc/VirtualMedia/{virtual_media_id}
+      virtual_media_eject_path: /redfish/v1/Managers/bmc/VirtualMedia/{virtual_media_id}/Actions/VirtualMedia.EjectMedia
+      reboot_action_path: /redfish/v1/Systems/system/Actions/ComputerSystem.Reset
+      manager_reset_action_path: /redfish/v1/Managers/bmc/Actions/Manager.Reset
+      task_service_path: /redfish/v1/TaskService/Tasks
+    reboot_action_payload:
+      ResetType: GracefulShutdown
+    manager_reset_action_payload:
+      ResetType: GracefulRestart
+    boot_state_fields:
+      - PowerState
+      - Status.State
+    host_reachable_fields:
+      - host_reachable
+    power_state_field: PowerState
+    power_off_values:
+      - "Off"
+    hostname_field: HostName
+    esxi_install_boot_state_values:
+      load_iso:
+        - osrunning
+      reboot_after_iso_load:
+        - none
+        - oem
+        - memoryinitializationstarted
+        - systemhardwareinitializationcomplete
+      kickstart_load:
+        - osrunning
+      reboot_after_kickstart_load:
+        - none
+        - oem
+        - memoryinitializationstarted
+        - systemhardwareinitializationcomplete
+      os_load:
+        - osrunning
+
+  # Older/legacy Intel BMC firmware generations that predate the "system"/
+  # "bmc" resource-id naming convention above and instead used numeric
+  # resource IDs (a common pattern on pre-OpenBMC-consolidation Redfish
+  # stacks). Used as the fallback set when openbmc_current endpoints 404
+  # or time out, so a fix can walk from new server naming down to old.
+  openbmc_legacy:
+    endpoints:
+      session_path: /redfish/v1/SessionService/Sessions
+      system_path: /redfish/v1/Systems/1
+      manager_path: /redfish/v1/Managers/1
+      chassis_path: /redfish/v1/Chassis/1
+      ethernet_interface_path: /redfish/v1/Managers/1/EthernetInterfaces/1
+      network_protocol_path: /redfish/v1/Managers/1/NetworkProtocol
+      boot_status_path: /redfish/v1/Systems/1/
+      lifecycle_log_path: /redfish/v1/Systems/1/LogServices/EventLog/Entries
+      virtual_media_path: /redfish/v1/Managers/1/VirtualMedia/{virtual_media_id}
+      virtual_media_eject_path: /redfish/v1/Managers/1/VirtualMedia/{virtual_media_id}/Actions/VirtualMedia.EjectMedia
+      reboot_action_path: /redfish/v1/Systems/1/Actions/ComputerSystem.Reset
+      manager_reset_action_path: /redfish/v1/Managers/1/Actions/Manager.Reset
+      task_service_path: /redfish/v1/TaskService/Tasks
+    reboot_action_payload:
+      ResetType: GracefulShutdown
+    manager_reset_action_payload:
+      ResetType: GracefulRestart
+    boot_state_fields:
+      - PowerState
+      - Status.State
+    host_reachable_fields:
+      - host_reachable
+    power_state_field: PowerState
+    power_off_values:
+      - "Off"
+    hostname_field: HostName
+    esxi_install_boot_state_values:
+      load_iso:
+        - osrunning
+      reboot_after_iso_load:
+        - none
+        - oem
+        - memoryinitializationstarted
+        - systemhardwareinitializationcomplete
+      kickstart_load:
+        - osrunning
+      reboot_after_kickstart_load:
+        - none
+        - oem
+        - memoryinitializationstarted
+        - systemhardwareinitializationcomplete
+      os_load:
+        - osrunning
