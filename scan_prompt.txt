@@ -1,0 +1,293 @@
+SCAN FIX PROMPT — Intel Server RAID1 Creation Failure (HTTP 405 ActionNotSupported)
+=====================================================================================
+
+CONTEXT / ROLE
+--------------
+You are implementing a fix inside an existing automation codebase that performs
+hardware "scan" operations against Intel Server System BMCs (Baseboard Management
+Controllers) over the Redfish REST API. You do NOT have access to Intel's official
+Redfish specification PDF or any other reference document — everything you need
+to implement this fix is provided below. Do not guess at endpoints not listed here;
+if you need an endpoint not covered, fall back to the DMTF Redfish standard schema
+(redfish.dmtf.org) conventions described below.
+
+THE PROBLEM
+-----------
+During a scan/build operation, RAID array creation failed with:
+
+    ❌ RAID1 creation — HTTP 405 ActionNotSupported
+
+This happened specifically when requesting a RAID1 (mirrored) logical drive.
+Other RAID levels (e.g. RAID0, RAID5) may or may not exhibit the same failure —
+treat this as a per-controller, per-RAID-level compatibility problem, not a
+blanket "RAID creation is broken" problem.
+
+WHAT "HTTP 405 ActionNotSupported" MEANS (Redfish semantics)
+--------------------------------------------------------------
+Per the DMTF Redfish Base Message Registry (the standard error-message catalog
+every conformant Redfish service, including Intel's OpenBMC-based BMC, must use):
+
+  MessageId:    Base.1.x.ActionNotSupported
+  Description:  "Indicates that the action supplied with the POST operation is
+                 not supported by the resource."
+  Message:      "The action %1 is not supported by the resource." (%1 = the
+                 action name that was attempted, e.g. "StorageLDrive.Create")
+  Severity:     Critical
+  Resolution:   "Check the Actions property in the resource for the supported
+                 actions."
+  Typical HTTP status: 405 Method Not Allowed
+
+A Redfish error response body for this looks like:
+
+    {
+      "error": {
+        "code": "Base.1.5.0.GeneralError",
+        "message": "A general error has occurred.",
+        "@Message.ExtendedInfo": [
+          {
+            "@odata.type": "#Message.v1_0_7.Message",
+            "MessageId": "Base.1.5.0.ActionNotSupported",
+            "Message": "The action #StorageCollection.CreateDrive is not supported by the resource.",
+            "Severity": "Critical",
+            "Resolution": "Check the Actions property in the resource for the supported actions."
+          }
+        ]
+      }
+    }
+
+WHY THIS HAPPENS ON A REAL CONTROLLER (root causes to check, in order)
+------------------------------------------------------------------------
+1. The RAID controller resource you POSTed the create-action to genuinely does
+   not implement that action at all for this firmware/controller model. Some
+   hardware RAID controllers only expose a subset of actions via Redfish
+   depending on firmware revision.
+2. The controller implements RAID creation, but restricts which RAID levels it
+   will build. Its "Actions" property (see below) or an associated
+   @Redfish.ActionInfo resource will enumerate exactly which RAID
+   type/level values it accepts — if RAID1 is not in that list, the 405 is
+   expected/correct behavior, not a bug to route around blindly.
+3. The action was POSTed to the wrong resource path for this firmware
+   generation (e.g. posted to the individual RAID controller resource when
+   this generation expects it on the parent Storage collection root, or
+   vice versa).
+4. The BMC only implements the generic DMTF-standard Volume creation path
+   (POST a Volume object to the Storage controller's Volumes collection)
+   and does NOT implement Intel's OEM StorageLDrive.Create action at all —
+   in that case 405 on the OEM action is completely expected, and you must
+   use the DMTF-standard path instead (detailed below).
+
+REQUIRED DIAGNOSTIC STEP BEFORE RETRYING ANYTHING
+----------------------------------------------------
+Before retrying or falling back, GET the target Storage controller resource
+itself and inspect its own "Actions" property plus, if present, any
+"@Redfish.ActionInfo" link:
+
+    GET /redfish/v1/Systems/system/Storage/{controllerId}
+
+Response shape (relevant fields only):
+
+    {
+      "@odata.id": "/redfish/v1/Systems/system/Storage/Raid_0",
+      "StorageControllers": [
+        {
+          "Manufacturer": "...",
+          "Model": "...",
+          "SupportedRAIDTypes": ["RAID0", "RAID5", "RAID6"]   // <-- if present, and
+                                                                //     RAID1 is absent,
+                                                                //     that's your answer
+        }
+      ],
+      "Volumes": { "@odata.id": "/redfish/v1/Systems/system/Storage/Raid_0/Volumes" },
+      "Actions": {
+        "#StorageCollection.CreateDrive": {
+          "target": "/redfish/v1/Systems/system/Storage/Raid_0/Actions/StorageLDrive.Create",
+          "@Redfish.ActionInfo": "/redfish/v1/Systems/system/Storage/Raid_0/CreateVolumeBasicDataActionInfo"
+        }
+      }
+    }
+
+If an @Redfish.ActionInfo URI is present, GET it — it lists every parameter
+this specific action accepts on this specific controller and their
+AllowableValues (this is the authoritative, per-controller answer to "does
+this thing support RAID1 at all"):
+
+    GET /redfish/v1/Systems/system/Storage/Raid_0/CreateVolumeBasicDataActionInfo
+
+    {
+      "Parameters": [
+        {
+          "Name": "Rrl",
+          "AllowableValues": ["0", "2", "3"]   // e.g. RAID0, RAID5, RAID6 only —
+                                                //      RAID1 (value "1") absent
+        }
+      ]
+    }
+
+Build your diagnostic output to explicitly state: "Requested RAID1, but this
+controller's supported set is {X, Y, Z}" — do not just say "action not
+supported" with no further detail. Surface the controller's own advertised
+capability list every time this failure occurs.
+
+INTEL OEM RAID CREATE ACTION (the path that is 405'ing)
+---------------------------------------------------------
+Endpoint:  POST /redfish/v1/Systems/system/Storage/{controllerId}/Actions/StorageLDrive.Create
+
+Body parameters (Intel/AMI OEM extension, not a DMTF-standard body):
+
+    {
+      "CmdParm": 1,        // 0 = CLEAR CFG, 1 = ADD CFG
+      "Rrl": 1,             // Primary RAID level. 0=RAID0, 1=RAID1, 2=RAID5,
+                             // 3=RAID6, 4/5/6=RAID1E variants, 7=RAID00,
+                             // 8=RAID10, 9=RAID50, 0xA=RAID60
+      "StripSize": 9,        // controller-specific enum for stripe size
+      "InitState": 0,
+      "DiskCachePolicy": 0,  // 0=Unchanged, 1=Enabled, 2=Disabled
+      "SizeLow": 0,          // low DWORD of requested volume size (0 = max/default)
+      "SizeHigh": 0,         // high DWORD of requested volume size
+      "Readpolicy": 1,       // 0=No Read Ahead, 1=Always Read Ahead
+      "Writepolicy": 1,       // 0=Write Through, 1=Always Write Back, 2=Write Back with BBU
+      "Iopolicy": 0,          // 0=DirectIO, 1=CachedIO
+      "Accesspolicy": 0,      // 0=Read-Write, 1=Read Only, 2=Blocked
+      "SpanDepth": 1,          // number of spans; RAID00/10/50/60 require > 1
+      "NumDrives": 2,          // number of physical drives per span
+      "DeviceID": [4, 5]       // integer physical drive IDs to include
+    }
+
+RAID1 SPECIFICALLY REQUIRES >= 2 DRIVES. If NumDrives/DeviceID has fewer than
+2 entries for Rrl=1, that is a client-side bug that will ALSO produce a
+rejection (though possibly a different error than 405) — validate this before
+even attempting the request.
+
+FALLBACK PATH #1 — action on the Storage collection root (older firmware)
+-----------------------------------------------------------------------------
+Some older Intel BMC firmware builds expose the create action off the parent
+Storage collection instead of the individual controller resource:
+
+    POST /redfish/v1/Systems/system/Storage/Actions/StorageLDrive.Create
+
+Same body shape as above. Try this if the per-controller path 405s AND the
+controller's own Actions property (from the diagnostic step) does not list
+the create action at that exact path.
+
+FALLBACK PATH #2 — DMTF-standard Volume creation (generic Redfish, most
+likely to actually succeed for a RAID1 405 on the OEM action)
+-----------------------------------------------------------------------------
+The DMTF standard Redfish way to create any RAID volume — including
+mirrored/RAID1 — that does NOT depend on Intel's OEM action at all is to POST
+a Volume resource directly to the controller's Volumes collection:
+
+    POST /redfish/v1/Systems/system/Storage/{controllerId}/Volumes
+
+Body (DMTF Volume schema — redfish.dmtf.org/schemas/v1/Volume.json):
+
+    {
+      "RAIDType": "RAID1",
+      "StripSizeBytes": 65536,
+      "Links": {
+        "Drives": [
+          { "@odata.id": "/redfish/v1/Systems/system/Storage/{controllerId}/Drives/4" },
+          { "@odata.id": "/redfish/v1/Systems/system/Storage/{controllerId}/Drives/5" }
+        ]
+      }
+    }
+
+Full DMTF Volume.RAIDType enum (use this table to translate any Intel-OEM
+numeric Rrl value into the correct DMTF RAIDType string when building this
+fallback body):
+
+    RAIDType   Meaning
+    --------   --------------------------------------------------------------
+    RAID0      Striped, no redundancy
+    RAID1      Mirrored across >= 2 independent devices (THIS IS THE ONE THAT 405'd)
+    RAID3      Byte-level striping with dedicated parity device
+    RAID4      Block-level striping with dedicated parity device
+    RAID5      Block-level striping with distributed parity (n data + 1 parity)
+    RAID6      Block-level striping with two independent distributed parities
+    RAID10     Striped set of mirrored devices
+    RAID01     Mirrored set of striped devices
+    RAID1E     Mirroring with blocks duplicated across pairs, uniformly distributed
+    RAID50     RAID0 stripe over two or more RAID5 sets
+    RAID60     RAID0 stripe over two or more RAID6 sets
+    RAID00     RAID0 stripe over two or more RAID0 sets
+    RAID10E    RAID0 stripe over two or more RAID10 sets
+    None       No redundancy at the device level
+
+REQUIRED RETRY / FALLBACK ORDER (must implement exactly this sequence)
+--------------------------------------------------------------------------
+This fix MUST work against both NEW and OLD generations of Intel server BMC
+firmware. Different generations expose different endpoint shapes for the
+same operation. Implement a "try newest shape first, fall back to older
+shapes, stop at first success" loop — NOT a single hardcoded call. Concretely:
+
+  1. Resolve the actual RAID controller resource ID that exists on this BMC.
+     Do not assume a fixed name — try candidates in order until one GETs
+     successfully: "Raid_0", "Raid_1" (older Intel naming), then
+     "RAID.Integrated.1", "RAID.0" (newer DMTF-style naming some BMC vendors
+     have converged on). Use whichever one first returns HTTP 200.
+
+  2. Attempt RAID creation in this exact order, stopping at the first success:
+       a. POST .../Storage/{controllerId}/Actions/StorageLDrive.Create (current/new-server shape)
+       b. POST .../Storage/Actions/StorageLDrive.Create (older-firmware shape — action on collection root)
+       c. POST .../Storage/{controllerId}/Volumes with RAIDType body (DMTF-standard fallback —
+          the path most likely to succeed when (a) and (b) both 405)
+
+  3. If a step fails with HTTP 405 / MessageId "ActionNotSupported" specifically
+     (not any other error), before moving to the next fallback OR before giving
+     up entirely, run the diagnostic step above (GET the controller resource +
+     any @Redfish.ActionInfo) and attach its result to the failure record —
+     specifically state whether RAID1 is or is not in the controller's
+     advertised supported set.
+
+  4. If ALL fallback attempts fail, raise/report an error that includes:
+       - every endpoint attempted and its exact failure (status code + MessageId)
+       - the controller's own advertised SupportedRAIDTypes / ActionInfo
+         AllowableValues (if retrievable)
+       - a plain-English conclusion: either "this controller does not support
+         RAID1" (if confirmed via step 3) or "no working create-RAID endpoint
+         found on this firmware" (if the diagnostic itself couldn't confirm
+         RAID1 support either way)
+
+  5. On success, verify the volume was actually created by GETing
+     .../Storage/{controllerId}/Volumes and confirming a new member with
+     RAIDType == "RAID1" (or the OEM-side equivalent) now exists — do not
+     trust a 200/202 response alone, since RAID creation is asynchronous.
+
+VALIDATION TO PERFORM BEFORE ANY CREATE ATTEMPT
+---------------------------------------------------
+  - Confirm every requested physical drive ID is actually free: GET the
+    controller resource's Drives list, GET each Drive, and only proceed if
+    Status.State == "Enabled" and the drive is not already referenced by any
+    existing Volume.
+  - Confirm len(DeviceID) matches NumDrives.
+  - Confirm len(DeviceID) >= 2 specifically when Rrl == 1 (RAID1) or
+    RAIDType == "RAID1" — RAID1 cannot be built on a single drive.
+  - Confirm SpanDepth > 1 for any multi-span level (RAID00, RAID10, RAID50,
+    RAID60) — this is unrelated to the RAID1 case but must not regress.
+
+AUTHENTICATION (required for every request above)
+------------------------------------------------------
+Establish a session first:
+
+    POST /redfish/v1/SessionService/Sessions
+    Body: {"UserName": "<user>", "Password": "<password>"}
+
+Response includes header "X-Auth-Token" — attach this token as the
+"X-Auth-Token" header on every subsequent request. Also capture the
+"Location" response header — that is the session's own URI, and you must
+DELETE it when done to release the BMC-side session slot:
+
+    DELETE <session_uri_from_Location_header>
+
+DELIVERABLE
+-----------
+Implement this as a self-contained fix function (or small module) with:
+  - a controller-ID resolver with old/new naming fallback
+  - a create-RAID function implementing the 3-step fallback chain above
+  - a diagnostic helper that fetches and returns the controller's actual
+    supported actions/RAID types when a 405/ActionNotSupported is hit
+  - pre-flight validation (drive availability, NumDrives/DeviceID count,
+    RAID1 >= 2 drives, multi-span SpanDepth)
+  - post-creation verification via the Volumes collection
+  - clear, structured error output that never surfaces a bare "405 Client
+    Error" — always include the MessageId, the attempted endpoint, and (when
+    it's an ActionNotSupported failure) the controller's own capability list

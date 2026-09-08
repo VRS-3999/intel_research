@@ -1,5 +1,8 @@
 """
-Fix for the FAILED/blocked steps in decomm.txt on an Intel server:
+Fix for the FAILED/blocked steps captured across two related decomm
+failures on an Intel server.
+
+=== decomm.txt step failures ===
 
   Step 11.1  ILO A-Record Check/Rename (serial-ilo): FAILED
              error: IloIPReconfig <uid> did not complete within 1800s
@@ -18,8 +21,29 @@ Fix for the FAILED/blocked steps in decomm.txt on an Intel server:
              vault. Last error: ... Connection timed out (connect
              timeout=30)
 
-Root causes and how each is remediated here, via Redfish rather than the
-failing dependency:
+=== Additional decomm failure (Mojo power-state set, distinct bug) ===
+
+  {'api_req_uuid': '312615cf-4775-412e-9ef9-5418c4598c37',
+   'desired_power_state': 'off',
+   'err_msg': "Error in set_power_state wrapper: module "
+              "'apt_mojo_consumer.apt_mojo_methods' has no attribute "
+              "'set_power_state'",
+   'parent_api_reqid': '68feadcc-c496-48d3-bfd9-183889828132',
+   'serial': 'LUC223400173', 'status': 'failed', 'success': False}
+
+  This is NOT an HTTP error and NOT a credentials/timeout error — it is
+  a Python AttributeError raised *inside* the internal Mojo consumer
+  package itself (apt_mojo_consumer.apt_mojo_methods has no
+  set_power_state function/method at all). That means the automation's
+  chosen power-off path — routing the "set power state to off" request
+  through Mojo — is broken at the code level on the Mojo side (e.g. a
+  renamed/removed method after a Mojo library upgrade, or a
+  version-skewed apt_mojo_consumer install). No retry against Mojo can
+  fix this; only bypassing Mojo and issuing the power-off directly to
+  the BMC via Redfish resolves it.
+
+=== Root causes and how each is remediated here, via Redfish rather
+    than the failing dependency ===
 
   - Step 11.1 got stuck because the automation waited on an internal
     "IloIPReconfig" job instead of driving the BMC's Ethernet interface
@@ -38,6 +62,17 @@ failing dependency:
     supplied credential with backoff before giving up, and once
     connected, re-runs the actual power-off validation via Redfish.
 
+  - The Mojo "set_power_state" AttributeError failure is remediated by
+    set_power_state_via_redfish() below: it never calls into
+    apt_mojo_consumer at all. It issues ComputerSystem.Reset with the
+    Redfish ResetType that corresponds to the requested
+    `desired_power_state` ("off" -> GracefulShutdown, falling back to
+    ForceOff if the graceful request doesn't change PowerState in time),
+    then verifies PowerState directly from the BMC. The original
+    api_req_uuid/serial from the failed Mojo call are accepted as
+    optional correlation fields purely for logging/traceability, since
+    they identify which decomm request this is remediating.
+
 Every BMC resource access in this module is attempted against each
 firmware generation defined in intel.yaml (modeled on the existing
 dell.yaml), in the order they're declared there: "openbmc_current" (new
@@ -47,9 +82,9 @@ Intel server naming, e.g. /Systems/system, /Managers/bmc) first, then
 redfish_client, so a fix that works on a new server automatically falls
 back to whatever an old server actually exposes, and vice versa.
 
-Depends on redfish_client.RedfishClient / try_variants for auth,
-session handling, and the old/new fallback mechanism, and on PyYAML to
-load intel.yaml.
+Depends on redfish_client.RedfishClient / RedfishError / try_variants
+for auth, session handling, rich error detail, and the old/new fallback
+mechanism, and on PyYAML to load intel.yaml.
 """
 
 import os
@@ -58,6 +93,22 @@ import time
 import yaml
 
 from redfish_client import RedfishClient, try_variants
+
+# Maps a Mojo-style desired_power_state string to the Redfish ResetType
+# that achieves it on first attempt, per the ComputerSystem.Reset action
+# (Intel OpenBMC spec section 2.49 Actions / DMTF ComputerSystem schema
+# ResetType enum).
+DESIRED_POWER_STATE_TO_RESET_TYPE = {
+    "off": "GracefulShutdown",
+    "on": "On",
+}
+
+# Escalation used if the first ResetType above doesn't change PowerState
+# within the timeout — matches the corresponding forceful ResetType.
+ESCALATED_RESET_TYPE = {
+    "off": "ForceOff",
+    "on": "ForceOn",
+}
 
 
 def load_intel_config(path=None):
@@ -285,14 +336,109 @@ def fix_power_off_validation(host, credentials, config, max_attempts_per_credent
         bmc.logout()
 
 
+def set_power_state_via_redfish(bmc, config, desired_power_state="off",
+                                 poll_interval_seconds=10, timeout_seconds=180,
+                                 api_req_uuid=None, serial=None):
+    """
+    Remediates the Mojo failure:
+      "Error in set_power_state wrapper: module
+       'apt_mojo_consumer.apt_mojo_methods' has no attribute
+       'set_power_state'"
+
+    That error is an AttributeError inside Mojo's own consumer package —
+    the method the automation tried to call does not exist in the
+    installed apt_mojo_consumer version. No amount of retrying the Mojo
+    call will help; this function bypasses apt_mojo_consumer entirely
+    and drives the power state change straight through Redfish:
+
+      1. Maps `desired_power_state` ("off"/"on") to the corresponding
+         ComputerSystem.Reset ResetType (GracefulShutdown/On) via
+         DESIRED_POWER_STATE_TO_RESET_TYPE, and POSTs it against every
+         firmware version's reboot_action_path from intel.yaml
+         (new-server shape first, old-server shape as fallback).
+      2. Polls get_power_state_with_fallback() every
+         `poll_interval_seconds` until PowerState reflects the desired
+         state or `timeout_seconds` elapses.
+      3. If the graceful reset didn't take effect in time, escalates to
+         the forceful ResetType (ForceOff/ForceOn per
+         ESCALATED_RESET_TYPE) and polls again for the same timeout.
+      4. Returns a dict including the original `api_req_uuid`/`serial`
+         (if given) purely for correlating this remediation back to the
+         specific failed Mojo request it replaces — they are not sent
+         to the BMC.
+
+    Raises RuntimeError with the full attempt history if the desired
+    power state is still not reached after both the graceful and
+    escalated attempts.
+    """
+    if desired_power_state not in DESIRED_POWER_STATE_TO_RESET_TYPE:
+        raise ValueError(f"Unsupported desired_power_state '{desired_power_state}'; expected 'on' or 'off'")
+
+    result = {"api_req_uuid": api_req_uuid, "serial": serial, "desired_power_state": desired_power_state}
+
+    def _issue_reset(reset_type):
+        variants = _version_endpoint_variants(
+            config, "reboot_action_path",
+            lambda path, cfg: bmc.post(path, {"ResetType": reset_type}),
+        )
+        return try_variants(variants)
+
+    def _wait_for_state(deadline):
+        while time.time() < deadline:
+            state = get_power_state_with_fallback(bmc, config)
+            target_is_off = desired_power_state == "off"
+            reached = state["confirmed_off"] if target_is_off else not state["confirmed_off"]
+            if reached:
+                return state
+            time.sleep(poll_interval_seconds)
+        return None
+
+    graceful_reset_type = DESIRED_POWER_STATE_TO_RESET_TYPE[desired_power_state]
+    reset_version, reset_response = _issue_reset(graceful_reset_type)
+    result["graceful_reset_type"] = graceful_reset_type
+    result["graceful_reset_version"] = reset_version
+    result["graceful_reset_response"] = reset_response
+
+    final_state = _wait_for_state(time.time() + timeout_seconds)
+    if final_state is not None:
+        result["final_power_state"] = final_state
+        result["escalated"] = False
+        return result
+
+    escalated_reset_type = ESCALATED_RESET_TYPE[desired_power_state]
+    reset_version, reset_response = _issue_reset(escalated_reset_type)
+    result["escalated_reset_type"] = escalated_reset_type
+    result["escalated_reset_version"] = reset_version
+    result["escalated_reset_response"] = reset_response
+
+    final_state = _wait_for_state(time.time() + timeout_seconds)
+    if final_state is not None:
+        result["final_power_state"] = final_state
+        result["escalated"] = True
+        return result
+
+    raise RuntimeError(
+        f"Power state '{desired_power_state}' not reached after graceful "
+        f"({graceful_reset_type}) and escalated ({escalated_reset_type}) resets, "
+        f"each polled for {timeout_seconds}s. Attempt detail: {result}"
+    )
+
+
 def run_decomm_fixes(host, credentials, new_hostname, config_path=None,
-                      stuck_ilo_task_uid=None, apply_hostname_via_reset=True):
+                      stuck_ilo_task_uid=None, apply_hostname_via_reset=True,
+                      mojo_power_state_failure=None):
     """
     End-to-end remediation for every FAILED/blocked step captured in
-    decomm.txt:
+    decomm.txt, plus the separate Mojo "set_power_state" AttributeError
+    failure when one is supplied:
       - Step 17: credential/connectivity retry, then power-off validation
       - Step 11.1: stuck ILO A-record rename
       - Step 15 / 16.1: Mojo-independent serial number + power state
+      - Mojo set_power_state AttributeError: if `mojo_power_state_failure`
+        is given as a dict with keys desired_power_state/api_req_uuid/
+        serial (matching the failed Mojo payload), remediates it via
+        set_power_state_via_redfish() instead of retrying the broken
+        Mojo call.
     Each step's failure is caught and recorded individually rather than
     aborting the run, mirroring how the original decomm continued past
     each FAILED entry to attempt the remaining steps. Note that if
@@ -336,6 +482,17 @@ def run_decomm_fixes(host, credentials, new_hostname, config_path=None,
     except Exception as exc:
         results["step_16_1_mojo_power_state_check"] = {"error": str(exc)}
 
+    if mojo_power_state_failure:
+        try:
+            results["mojo_set_power_state_fix"] = set_power_state_via_redfish(
+                bmc, config,
+                desired_power_state=mojo_power_state_failure.get("desired_power_state", "off"),
+                api_req_uuid=mojo_power_state_failure.get("api_req_uuid"),
+                serial=mojo_power_state_failure.get("serial"),
+            )
+        except Exception as exc:
+            results["mojo_set_power_state_fix"] = {"error": str(exc)}
+
     bmc.logout()
     return results
 
@@ -370,9 +527,21 @@ if __name__ == "__main__":
             "(user1:pass1,user2:pass2) or BMC_USER/BMC_PASSWORD env vars first"
         )
 
+    # Matches the failed Mojo payload:
+    # {'api_req_uuid': '312615cf-4775-412e-9ef9-5418c4598c37',
+    #  'desired_power_state': 'off',
+    #  'parent_api_reqid': '68feadcc-c496-48d3-bfd9-183889828132',
+    #  'serial': 'LUC223400173'}
+    mojo_power_state_failure = {
+        "desired_power_state": os.environ.get("MOJO_DESIRED_POWER_STATE", "off"),
+        "api_req_uuid": os.environ.get("MOJO_API_REQ_UUID"),
+        "serial": os.environ.get("MOJO_SERIAL"),
+    }
+
     results = run_decomm_fixes(
         host, credentials, new_hostname,
         config_path=config_path,
         stuck_ilo_task_uid=stuck_ilo_task_uid,
+        mojo_power_state_failure=mojo_power_state_failure,
     )
     print(results)

@@ -1,0 +1,184 @@
+DECOMM FIX PROMPT — Intel Server Power-Off Failure via Broken Mojo Consumer Method
+=====================================================================================
+
+CONTEXT / ROLE
+--------------
+You are implementing a fix inside an existing automation codebase that performs
+server "decommission" (decomm) operations against Intel Server System BMCs
+(Baseboard Management Controllers). Decomm automation currently routes the final
+"power the server off" step through an internal service called Mojo (accessed via
+a Python package named apt_mojo_consumer). You do NOT have access to Intel's
+official Redfish specification PDF, Mojo's internal source code, or any other
+reference document beyond what is provided below. Everything needed to implement
+this fix — including the exact Redfish endpoints, payloads, and retry/fallback
+strategy — is specified here.
+
+THE PROBLEM (exact failure log)
+-----------------------------------
+    {
+      'api_req_uuid': '312615cf-4775-412e-9ef9-5418c4598c37',
+      'desired_power_state': 'off',
+      'err_msg': "Error in set_power_state wrapper: module "
+                 "'apt_mojo_consumer.apt_mojo_methods' has no attribute "
+                 "'set_power_state'",
+      'parent_api_reqid': '68feadcc-c496-48d3-bfd9-183889828132',
+      'serial': 'LUC223400173',
+      'status': 'failed',
+      'success': False
+    }
+
+WHY THIS IS DIFFERENT FROM A NORMAL API/NETWORK FAILURE
+------------------------------------------------------------
+Read the err_msg carefully: "module 'apt_mojo_consumer.apt_mojo_methods' has no
+attribute 'set_power_state'". This is a Python AttributeError raised from INSIDE
+the Mojo consumer library itself — the function/method the decomm automation
+tried to call does not exist in whatever version of apt_mojo_consumer is
+currently installed (e.g. it was renamed or removed in a library upgrade, or a
+version-skewed/incompatible install is present on the automation host).
+
+This is NOT:
+  - an HTTP timeout or connection error
+  - a credentials/auth failure
+  - a transient outage that will resolve if you retry the same call again
+
+Retrying the exact same call into apt_mojo_consumer.apt_mojo_methods.set_power_state
+will fail every single time with the identical AttributeError, because the code
+path is broken, not the network path. THE ONLY CORRECT FIX IS TO STOP ROUTING
+THIS POWER-OFF REQUEST THROUGH MOJO AND ISSUE IT DIRECTLY TO THE BMC VIA REDFISH
+INSTEAD. Do not attempt to patch, monkey-patch, reimplement, or shim the missing
+Mojo method — treat Mojo as unavailable for this operation and bypass it entirely.
+
+CORRELATION FIELDS TO PRESERVE (for traceability only — never sent to the BMC)
+-----------------------------------------------------------------------------------
+The failed Mojo call carried three identifying fields. Your Redfish-based
+replacement must accept and echo these back in its result/log output so this
+remediation can be traced back to the original decomm request that failed:
+  - api_req_uuid   (e.g. "312615cf-4775-412e-9ef9-5418c4598c37")
+  - parent_api_reqid (e.g. "68feadcc-c496-48d3-bfd9-183889828132")
+  - serial         (e.g. "LUC223400173" — the server's serial number; use this,
+                     or resolve the BMC's IP/hostname by whatever inventory
+                     mapping your environment already uses for serial->host)
+  - desired_power_state (e.g. "off" — this is the actual instruction to carry out)
+
+REDFISH REPLACEMENT FOR set_power_state
+--------------------------------------------
+Authenticate first:
+
+    POST /redfish/v1/SessionService/Sessions
+    Body: {"UserName": "<user>", "Password": "<password>"}
+
+Response header "X-Auth-Token" must be attached as the "X-Auth-Token" header on
+every subsequent request. Capture the "Location" response header too — it is
+the session's own URI and must be DELETEd when finished:
+
+    DELETE <session_uri_from_Location_header>
+
+To change power state, POST the ComputerSystem.Reset action:
+
+    POST /redfish/v1/Systems/system/Actions/ComputerSystem.Reset
+    Body: {"ResetType": "<ResetType>"}
+
+Map desired_power_state to ResetType as follows:
+
+    desired_power_state   Try first (graceful)   Escalate to if not reached in time
+    --------------------   --------------------   -----------------------------------
+    "off"                  GracefulShutdown        ForceOff
+    "on"                   On                      ForceOn
+
+Full ResetType allowable values (Intel OpenBMC / DMTF ComputerSystem.Reset
+action), for reference/other callers in this codebase:
+    PushPowerButton, On, GracefulShutdown, GracefulRestart, ForceRestart,
+    PowerCycle, Nmi, ForceOn, ForceOff
+
+After issuing the reset, POLL for the actual result — a 200/202 response from
+the Reset action only means the request was accepted, NOT that the power state
+has changed yet:
+
+    GET /redfish/v1/Systems/system
+
+Response includes a top-level "PowerState" field with value "On" or "Off".
+Poll this every ~10 seconds. If desired_power_state == "off", success means
+PowerState == "Off". If it has not reached the target state within a
+reasonable timeout (e.g. 180 seconds) after the graceful ResetType, re-POST the
+escalated ResetType (ForceOff for "off", ForceOn for "on") and poll again for
+the same timeout before giving up.
+
+OLD-SERVER VS NEW-SERVER ENDPOINT FALLBACK (mandatory — implement exactly this)
+------------------------------------------------------------------------------------
+Intel BMC firmware has shipped at least two different resource-ID naming
+conventions across generations:
+
+    Resource            New-server path (try first)        Old-server path (fallback)
+    -------------------  ----------------------------------  -------------------------------
+    ComputerSystem       /redfish/v1/Systems/system           /redfish/v1/Systems/1
+    Manager (BMC)         /redfish/v1/Managers/bmc              /redfish/v1/Managers/1
+    Reset action           /redfish/v1/Systems/system/Actions/  /redfish/v1/Systems/1/Actions/
+                            ComputerSystem.Reset                 ComputerSystem.Reset
+
+Your fix MUST implement a "try new-server path, and only if that fails fall
+back to old-server path, stop at first success" loop for BOTH the Reset action
+POST and every subsequent PowerState GET poll — do not hardcode a single path.
+Concretely:
+
+  1. Attempt POST against the new-server system_path's Actions/ComputerSystem.Reset.
+  2. If that request itself fails (connection error, 404, or any non-2xx), retry
+     the identical POST against the old-server system_path's
+     Actions/ComputerSystem.Reset instead.
+  3. Once one of the two paths succeeds for the Reset POST, use that SAME path
+     (new or old, whichever worked) for all subsequent PowerState polling GETs
+     for this operation — don't alternate paths mid-poll.
+  4. If BOTH new and old paths fail for the initial Reset POST, raise/report an
+     error listing both attempts and their exact failures (status code and any
+     Redfish MessageId from the response body) rather than a generic failure.
+
+RETRY FOR TRANSIENT CONNECTIVITY ISSUES (separate from the old/new fallback)
+----------------------------------------------------------------------------------
+Independently of the endpoint-shape fallback above, wrap the initial
+authentication (SessionService/Sessions POST) with its own retry: attempt login
+up to 3 times with a short delay (e.g. 5 seconds) between attempts before
+declaring the credential itself bad and/or moving to the old-server fallback.
+This absorbs transient network blips distinct from the endpoint-shape mismatch
+this fix is primarily about.
+
+RESULT / OUTPUT REQUIREMENTS
+---------------------------------
+The replacement function's return value (or logged result) must include, at
+minimum:
+  - api_req_uuid, parent_api_reqid, serial, desired_power_state (echoed from
+    the input, unchanged)
+  - which server-generation path (new or old) actually worked
+  - which ResetType was issued first, and whether escalation to the forceful
+    ResetType was needed
+  - the final observed PowerState value and a boolean confirming it matches
+    desired_power_state
+  - on total failure (both endpoint generations failed, or PowerState never
+    reached target after both graceful and escalated resets and their full
+    timeouts), a single raised error that lists every attempt made and its
+    exact failure reason — never a bare exception with no detail
+
+WHAT NOT TO DO
+------------------
+  - Do NOT call into apt_mojo_consumer.apt_mojo_methods.set_power_state (or any
+    other Mojo method) as part of this fix — Mojo is the broken dependency
+    being bypassed, not something to keep retrying.
+  - Do NOT assume a single hardcoded Systems/Managers resource path — always
+    implement the new-then-old fallback described above.
+  - Do NOT treat a 200/202 from the Reset action POST as confirmation that
+    power state changed — always poll PowerState afterward.
+  - Do NOT silently swallow failures — every failed attempt (auth, both
+    endpoint generations, both ResetType escalation levels) must be visible in
+    the final error/result output.
+
+DELIVERABLE
+-----------
+Implement this as a self-contained fix function with:
+  - retrying authentication (up to 3 attempts, short backoff)
+  - new-server-then-old-server endpoint fallback for both the Reset POST and
+    the PowerState polling GET, using whichever path first succeeds
+    consistently for the rest of the operation
+  - graceful-then-escalated ResetType handling with a bounded poll/timeout for
+    each
+  - a result object that echoes api_req_uuid/parent_api_reqid/serial/
+    desired_power_state and reports exactly which path/ResetType/attempt
+    succeeded (or a fully detailed failure if none did)
+  - this function must never invoke or depend on apt_mojo_consumer in any way
