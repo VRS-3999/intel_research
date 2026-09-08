@@ -75,9 +75,108 @@ WHY THIS HAPPENS ON A REAL CONTROLLER (root causes to check, in order)
    and does NOT implement Intel's OEM StorageLDrive.Create action at all —
    in that case 405 on the OEM action is completely expected, and you must
    use the DMTF-standard path instead (detailed below).
+5. **Intel VROC (Virtual RAID on CPU) is running in pass-through mode with no
+   license key installed.** This is a distinct, NVMe-specific root cause and,
+   on Intel Xeon Scalable NVMe platforms (e.g. Intel M50CYP), is the MOST
+   LIKELY explanation whenever the drives targeted for RAID1 are NVMe and the
+   controller reports no SupportedRAIDTypes at all. Read the dedicated section
+   below before spending effort on fallback paths 1/2 — no Redfish request
+   shape can create a RAID volume while VROC has no recognized license; this
+   is a hardware/BIOS/licensing state, not an API compatibility problem.
 
-REQUIRED DIAGNOSTIC STEP BEFORE RETRYING ANYTHING
-----------------------------------------------------
+VROC / NVMe RAID LICENSING (Intel Xeon Scalable NVMe platforms) — READ FIRST
+    IF THE TARGET DRIVES ARE NVMe
+----------------------------------------------------------------------------------
+On Intel Xeon Scalable servers (e.g. M50CYP), NVMe RAID is provided by Intel
+VROC (Virtual RAID on CPU), layered on top of Intel VMD (Volume Management
+Device). VMD/VROC has three relevant states:
+
+  1. VMD/VROC disabled in BIOS entirely: NVMe drives are exposed as plain
+     PCIe passthrough devices to the OS; no RAID membership is possible at
+     all, by BIOS/hardware design, regardless of Redfish.
+  2. VMD/VROC enabled but in "pass-through mode" with NO VROC license key
+     installed: NVMe drives enumerate under VMD but every drive is reported
+     as a "Non-RAID Physical Disk". This is the EXPECTED, documented
+     behavior of VROC with no key — it is NOT a bug in the BMC or in
+     Redfish, and no request-shape fallback fixes it.
+  3. VMD/VROC enabled with a valid license key installed (physical hardware
+     key on a motherboard header, OR a factory-set software license flag):
+     NVMe drives can be assembled into RAID volumes, gated by which key tier
+     is installed.
+
+VROC license tiers (sourced from published third-party Intel VROC hardware-key
+SKU/pricing guides — verify current tier-to-RAID-level mapping against your
+organization's Intel account team or current Intel VROC documentation before
+treating this as authoritative for a purchasing/provisioning decision):
+
+    Tier                SKU            RAID levels unlocked
+    ------------------  -------------  --------------------------------------
+    No key installed    (none)         none — pass-through only
+    Standard             VROCSTANMOD    RAID0, RAID1, RAID10
+    Premium               VROCPREMMOD    RAID0, RAID1, RAID10, RAID5, RAID6
+                                          (+ VROC Integrated Caching)
+    Intel SSD Only        VROCISSDMOD    same levels as Premium, but Intel-
+                                          branded SSDs only (cheaper than
+                                          Premium)
+
+Practical conclusion for THIS failure: RAID1 only requires the Standard tier
+(not Premium/Intel-SSD-Only). So if a hardware/software VROC key of ANY tier
+is genuinely already installed and BIOS/Redfish still reports pass-through /
+Non-RAID Physical Disks, that points to the key not being recognized (wrong
+header, BIOS setting not applied, key not actually present) rather than
+"the wrong/insufficient tier is installed" — escalate accordingly.
+
+REQUIRED VROC DETECTION STEP (do this BEFORE the general diagnostic step below,
+    whenever the target drives are NVMe)
+------------------------------------------------------------------------------------
+GET the controller resource and, for every drive linked under it, GET the
+Drive resource and check its "Protocol" field:
+
+    GET /redfish/v1/Systems/system/Storage/{controllerId}
+    GET /redfish/v1/Systems/system/Storage/{controllerId}/Drives/{driveId}   // for each linked drive
+
+    {
+      "Protocol": "NVMe",     // <-- if this is "NVMe" for the drives involved...
+      "Status": { "State": "Enabled" }
+    }
+
+If the controller's drives are NVMe AND the controller-level GET (see next
+section) reports NO "SupportedRAIDTypes" on any StorageControllers entry at
+all (not just RAID1 missing — literally none advertised), classify this
+failure as VROC pass-through with no license, NOT a generic ActionNotSupported
+compatibility gap. In that case:
+
+  - Do NOT burn all three fallback paths below expecting one to succeed —
+    none of them can create a RAID volume while VROC reports no license.
+  - Immediately surface a distinct, clearly-labeled result (e.g. a dedicated
+    exception/error type such as "VrocPassThroughError", not a generic
+    RuntimeError) so callers can apply the three-way decision this situation
+    requires:
+      1. If a VROC key SHOULD be installed on this server class per your
+         hardware/provisioning standard → this is a hardware/provisioning
+         gap. File that request, install the key, then retest Redfish RAID
+         creation — no code/API workaround exists for this path.
+      2. If Intel SDP (System Debug/Deployment/Provisioning tool — obtain
+         the exact command/API surface from your organization's SDP
+         documentation, not from this prompt, since it is not a Redfish/BMC
+         mechanism) is the sanctioned way to create VROC RAID volumes
+         out-of-band on these servers → investigate the SDP command/API and
+         integrate it as an additional fallback once confirmed.
+      3. If no RAID is expected on these NVMe drives at all (e.g. they are
+         intentionally used as independent/pass-through storage) → the
+         calling system (e.g. Forge) should mark this RAID operation as
+         skipped/not-supported rather than as a hard failure. Provide a
+         short structured "skip reason" string identifying the controller,
+         requested RAID type, and NVMe drive count for this purpose.
+  - Still attempt fallback paths 1/2 below ONLY if you want confirmation from
+    the BMC itself (some firmware will 405 immediately rather than making you
+    infer it from an empty SupportedRAIDTypes list) — but do not treat their
+    failure as a new/different problem once VROC pass-through is already
+    detected; it's the same root cause.
+
+REQUIRED DIAGNOSTIC STEP BEFORE RETRYING ANYTHING (non-NVMe / VROC-inconclusive
+    cases, or to corroborate the VROC detection above)
+----------------------------------------------------------------------------------
 Before retrying or falling back, GET the target Storage controller resource
 itself and inspect its own "Actions" property plus, if present, any
 "@Redfish.ActionInfo" link:
@@ -225,29 +324,44 @@ shapes, stop at first success" loop — NOT a single hardcoded call. Concretely:
      "RAID.Integrated.1", "RAID.0" (newer DMTF-style naming some BMC vendors
      have converged on). Use whichever one first returns HTTP 200.
 
-  2. Attempt RAID creation in this exact order, stopping at the first success:
+  2. BEFORE attempting any create-action variant, run the VROC detection step
+     above if the target drives are NVMe. If it detects pass-through mode
+     with no license (NVMe drives + no SupportedRAIDTypes advertised at
+     all), STOP HERE — raise/report the dedicated VROC-pass-through result
+     described above (with its three-way decision guidance) instead of
+     proceeding to step 3. Do not burn the fallback attempts below against a
+     licensing/BIOS-mode limitation that no request shape can overcome.
+     Only continue to step 3 if VROC detection is inconclusive (non-NVMe
+     controller, or NVMe with a non-empty SupportedRAIDTypes list that
+     simply doesn't include the requested level).
+
+  3. Attempt RAID creation in this exact order, stopping at the first success:
        a. POST .../Storage/{controllerId}/Actions/StorageLDrive.Create (current/new-server shape)
        b. POST .../Storage/Actions/StorageLDrive.Create (older-firmware shape — action on collection root)
        c. POST .../Storage/{controllerId}/Volumes with RAIDType body (DMTF-standard fallback —
           the path most likely to succeed when (a) and (b) both 405)
 
-  3. If a step fails with HTTP 405 / MessageId "ActionNotSupported" specifically
+  4. If a step fails with HTTP 405 / MessageId "ActionNotSupported" specifically
      (not any other error), before moving to the next fallback OR before giving
      up entirely, run the diagnostic step above (GET the controller resource +
-     any @Redfish.ActionInfo) and attach its result to the failure record —
-     specifically state whether RAID1 is or is not in the controller's
-     advertised supported set.
+     any @Redfish.ActionInfo, plus a fresh VROC pass-through check) and attach
+     its result to the failure record — specifically state whether RAID1 is
+     or is not in the controller's advertised supported set, AND whether VROC
+     pass-through was (re-)detected at this point.
 
-  4. If ALL fallback attempts fail, raise/report an error that includes:
+  5. If ALL fallback attempts fail, raise/report an error that includes:
        - every endpoint attempted and its exact failure (status code + MessageId)
        - the controller's own advertised SupportedRAIDTypes / ActionInfo
          AllowableValues (if retrievable)
-       - a plain-English conclusion: either "this controller does not support
-         RAID1" (if confirmed via step 3) or "no working create-RAID endpoint
-         found on this firmware" (if the diagnostic itself couldn't confirm
-         RAID1 support either way)
+       - the VROC pass-through check result (NVMe drive count, whether any
+         SupportedRAIDTypes were advertised)
+       - a plain-English conclusion: one of "this controller does not
+         support RAID1" (confirmed via step 4, non-VROC case), "VROC
+         pass-through with no license — see three-way decision guidance"
+         (VROC case), or "no working create-RAID endpoint found on this
+         firmware" (diagnostic inconclusive either way)
 
-  5. On success, verify the volume was actually created by GETing
+  6. On success, verify the volume was actually created by GETing
      .../Storage/{controllerId}/Volumes and confirming a new member with
      RAIDType == "RAID1" (or the OEM-side equivalent) now exists — do not
      trust a 200/202 response alone, since RAID creation is asynchronous.
@@ -282,12 +396,23 @@ DELIVERABLE
 -----------
 Implement this as a self-contained fix function (or small module) with:
   - a controller-ID resolver with old/new naming fallback
-  - a create-RAID function implementing the 3-step fallback chain above
+  - a VROC pass-through detector (NVMe Protocol check + empty
+    SupportedRAIDTypes check) that runs BEFORE the create-action attempts
+    and short-circuits them when pass-through-with-no-license is detected
+  - a dedicated, distinctly-typed result/exception for the VROC-pass-through
+    case (not a generic error) carrying enough detail (controller ID,
+    requested RAID type, NVMe drive count) for a caller to apply the
+    three-way decision: install a key and retest / investigate Intel SDP and
+    integrate it / mark this RAID operation skipped-not-supported
+  - a create-RAID function implementing the 3-step fallback chain above for
+    the non-VROC-pass-through case
   - a diagnostic helper that fetches and returns the controller's actual
-    supported actions/RAID types when a 405/ActionNotSupported is hit
+    supported actions/RAID types AND the VROC pass-through check result when
+    a 405/ActionNotSupported is hit
   - pre-flight validation (drive availability, NumDrives/DeviceID count,
     RAID1 >= 2 drives, multi-span SpanDepth)
   - post-creation verification via the Volumes collection
   - clear, structured error output that never surfaces a bare "405 Client
     Error" — always include the MessageId, the attempted endpoint, and (when
     it's an ActionNotSupported failure) the controller's own capability list
+    and VROC pass-through status

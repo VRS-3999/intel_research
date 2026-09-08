@@ -44,18 +44,85 @@ RAID logical drive creation runs as an asynchronous action
         controller collection root instead of the individual
         Raid_{ID} controller, or vice versa, depending on firmware
         generation).
+      - **Intel VROC (Virtual RAID on CPU) is in pass-through mode with
+        no license key installed** — this is a distinct, NVMe-specific
+        root cause confirmed for this platform family (e.g. Intel
+        M50CYP) and is the most likely explanation whenever the target
+        drives are NVMe and the controller reports no SupportedRAIDTypes
+        at all. See "VROC / NVMe RAID LICENSING" below — this is a
+        hardware/BIOS/licensing state, not something any Redfish request
+        shape can work around.
+
+=== VROC / NVMe RAID LICENSING (Intel Xeon Scalable NVMe platforms) ===
+
+On Intel Xeon Scalable servers (e.g. M50CYP), NVMe RAID is provided by
+Intel VROC (Virtual RAID on CPU), layered on top of Intel VMD (Volume
+Management Device). VMD/VROC has three relevant states:
+
+  1. VMD/VROC disabled in BIOS entirely: NVMe drives are exposed as
+     plain PCIe passthrough devices to the OS; no RAID membership is
+     possible at all, by BIOS/hardware design, regardless of Redfish.
+  2. VMD/VROC enabled but in "pass-through mode" with NO VROC license
+     key installed: NVMe drives enumerate under VMD but every drive is
+     reported as a "Non-RAID Physical Disk" (exactly the symptom
+     described for this platform). This is the expected, documented
+     behavior of VROC with no key — it is NOT a bug in this codebase,
+     the BMC, or Redfish, and no request-shape fallback fixes it.
+  3. VMD/VROC enabled with a valid license key installed (physical
+     hardware key on a header on the motherboard, OR a factory-set
+     software license flag): NVMe drives can be assembled into RAID
+     volumes, gated by which key tier is installed.
+
+VROC license tiers (confirmed via published third-party hardware-key
+pricing/spec guides referencing Intel's official SKUs — verify current
+tier-to-RAID-level mapping against your organization's Intel account
+team or current Intel VROC documentation before relying on this for a
+purchasing decision):
+  - No key installed:            pass-through only, NO RAID levels at all.
+  - VROCSTANMOD ("Standard"):    unlocks RAID0, RAID1, RAID10. Does NOT
+                                   unlock RAID5/RAID6.
+  - VROCPREMMOD ("Premium"):     everything Standard unlocks, PLUS
+                                   RAID5/RAID6, plus VROC Integrated
+                                   Caching (Optane SSD caching in Linux).
+  - VROCISSDMOD ("Intel SSD Only"): same RAID-level unlock as Premium,
+                                   but restricted to Intel-branded SSDs
+                                   only; priced below Premium.
+  Some OEMs (Dell, Lenovo, Supermicro, etc.) also offer a
+  factory-installed *software* license flag equivalent to
+  VROCPREM/VROCISSD with no physical key header required — whether that
+  applies to a given fleet is an OEM/BIOS configuration question, not a
+  Redfish one.
+
+practical conclusion for THIS failure: because RAID1 only requires the
+Standard tier (not Premium), if a licensed hardware/software VROC key of
+ANY tier is genuinely installed and BIOS still reports pass-through /
+Non-RAID Physical Disks, that points to the key not being recognized
+(wrong header, BIOS setting not applied, or key not actually present)
+rather than a "need a bigger license" problem — escalate accordingly
+rather than assuming Premium is required for RAID1.
 
 This module inspects/clears failed tasks, validates drive/parameter
 selection against the controller's actual state, and — the key
 addition for the 405 case — on any ActionNotSupported failure,
 immediately GETs the target resource's own "Actions" property and
-@Redfish.ActionInfo (when present) so the raised error names exactly
-which actions/RAID levels this controller actually supports, instead of
-surfacing a bare "405 Client Error". It then tries every known
-controller-ID naming and create-action shape (current spec first, then
-older/alternate shapes) via try_variants() from redfish_client, so a fix
-that works on the new fleet automatically falls back to whatever the old
-fleet actually expects, and vice versa.
+@Redfish.ActionInfo (when present), AND checks whether the target drives
+are NVMe with no SupportedRAIDTypes reported (the VROC pass-through
+signature), so the raised error/diagnosis distinguishes "this is a VROC
+licensing/BIOS-mode issue, not a request-shape bug" from a genuine
+firmware-endpoint mismatch, instead of surfacing a bare "405 Client
+Error". When VROC pass-through is detected, this module raises a
+dedicated VrocPassThroughError (see below) rather than exhausting every
+request-shape fallback pointlessly, since no Redfish request shape can
+create a RAID volume while VROC has no recognized license — the decision
+tree for what to do about that (install a key / use Intel SDP / mark
+unsupported) is documented on VrocPassThroughError itself.
+
+For non-NVMe-VROC controllers (traditional HW RAID / MegaRAID-style
+controllers) this module still tries every known controller-ID naming
+and create-action shape (current spec first, then older/alternate
+shapes) via try_variants() from redfish_client, so a fix that works on
+the new fleet automatically falls back to whatever the old fleet
+actually expects, and vice versa.
 
 Depends on redfish_client.RedfishClient / RedfishError / try_variants
 for auth, session handling, rich error detail, and the old/new fallback
@@ -65,6 +132,79 @@ mechanism.
 from redfish_client import RedfishClient, try_variants
 
 CANDIDATE_RAID_CONTROLLER_IDS = ["Raid_0", "Raid_1", "RAID.Integrated.1", "RAID.0"]
+
+# Confirmed VROC license tier -> unlocked RAID levels, per published
+# Intel VROC hardware-key SKU guides (VROCSTANMOD/VROCPREMMOD/VROCISSDMOD).
+# Verify against current Intel documentation before treating as
+# authoritative for licensing/purchasing decisions.
+VROC_TIER_UNLOCKED_RAID_TYPES = {
+    "none": [],  # no key installed: pass-through only, no RAID levels
+    "standard": ["RAID0", "RAID1", "RAID10"],
+    "premium": ["RAID0", "RAID1", "RAID10", "RAID5", "RAID6"],
+    "intel_ssd_only": ["RAID0", "RAID1", "RAID10", "RAID5", "RAID6"],  # Intel-branded SSDs only
+}
+
+
+class VrocPassThroughError(RuntimeError):
+    """
+    Raised instead of a generic "all variants failed" error when this
+    module detects that a RAID-creation failure is caused by Intel VROC
+    running in pass-through mode with no recognized license (NVMe drives
+    on this controller report Protocol == "NVMe" and the controller
+    itself advertises no SupportedRAIDTypes) — the documented,
+    expected VROC behavior with no key installed, not a bug in any
+    Redfish request shape.
+
+    Catching this specifically (rather than the generic RuntimeError
+    try_variants() raises) lets a caller implement the three-way
+    decision this situation actually requires, matching the escalation
+    already agreed for this platform:
+
+      1. If a VROC Standard/Premium/Intel-SSD-Only license key SHOULD be
+         installed on this server class per your hardware/provisioning
+         standard, this is a hardware/provisioning gap — file that
+         request, install the key, then retest Redfish RAID creation
+         (no code change needed here; it will start working once BIOS
+         reports a recognized key).
+      2. If Intel SDP (System Debug/Deployment/Provisioning tool — check
+         your organization's specific SDP documentation/API for the
+         exact command) is the sanctioned way to create VROC RAID
+         volumes out-of-band on these servers, integrate that SDP
+         call as an additional fallback in create_raid_array_safe()
+         once its command/API surface is confirmed.
+      3. If no RAID is expected on these NVMe drives at all (e.g. they
+         are intentionally used as independent/pass-through storage),
+         the caller (e.g. Forge) should catch VrocPassThroughError and
+         mark this operation as skipped/not-supported rather than a
+         hard failure — see `.as_skip_reason()` below for a ready-made
+         message for that path.
+    """
+
+    def __init__(self, controller_id, requested_raid_type, nvme_drive_count):
+        self.controller_id = controller_id
+        self.requested_raid_type = requested_raid_type
+        self.nvme_drive_count = nvme_drive_count
+        super().__init__(
+            f"Controller '{controller_id}' has {nvme_drive_count} NVMe drive(s) "
+            f"with no SupportedRAIDTypes advertised — this matches Intel VROC "
+            f"pass-through mode with no license key installed, not a request-shape "
+            f"bug. Requested RAID type: {requested_raid_type}. See "
+            f"VrocPassThroughError docstring for the required next steps "
+            f"(install VROC key / use Intel SDP / mark unsupported)."
+        )
+
+    def as_skip_reason(self):
+        """
+        Returns a short, structured reason string suitable for a caller
+        (e.g. Forge) to record when marking this RAID operation as
+        skipped/not-supported rather than failed, per decision path 3 in
+        this class's docstring.
+        """
+        return (
+            f"intel_raid_skipped_vroc_passthrough: controller={self.controller_id} "
+            f"requested={self.requested_raid_type} nvme_drives={self.nvme_drive_count}"
+        )
+
 
 # DMTF Redfish Volume.RAIDType enum (redfish.dmtf.org/schemas/v1/Volume.json),
 # used to translate the Intel OEM numeric Rrl into the standard RAIDType
@@ -184,6 +324,47 @@ def get_supported_actions(bmc, raid_controller_id):
         "available_actions": list(actions.keys()),
         "supported_raid_types_per_controller": supported_raid_types,
         "rrl_allowable_values_from_action_info": action_info_values,
+    }
+
+
+def detect_vroc_passthrough(bmc, raid_controller_id):
+    """
+    Checks whether this controller's failure to create a RAID volume is
+    explained by Intel VROC pass-through mode with no license key,
+    rather than a request-shape/firmware-endpoint mismatch. Per Intel's
+    documented VROC behavior (see module docstring "VROC / NVMe RAID
+    LICENSING"), the signature of this state is:
+
+      - The controller's Drives are NVMe (Drive.Protocol == "NVMe"), AND
+      - The controller reports no SupportedRAIDTypes at all on any of
+        its StorageControllers entries (get_supported_actions() returns
+        an empty supported_raid_types_per_controller).
+
+    Returns a dict: {"is_vroc_passthrough": bool, "nvme_drive_count": int,
+    "total_drive_count": int}. A non-NVMe controller (traditional HW
+    RAID / MegaRAID-style) will always return is_vroc_passthrough=False
+    here even with no SupportedRAIDTypes reported, since that combination
+    is specific to VMD/VROC-attached NVMe drives.
+    """
+    controller = bmc.get(f"/redfish/v1/Systems/system/Storage/{raid_controller_id}")
+    drives = controller.get("Drives", [])
+
+    nvme_drive_count = 0
+    for drive_link in drives:
+        try:
+            drive = bmc.get(drive_link["@odata.id"])
+        except Exception:
+            continue
+        if drive.get("Protocol") == "NVMe":
+            nvme_drive_count += 1
+
+    supported = get_supported_actions(bmc, raid_controller_id)
+    has_no_supported_raid_types = not supported.get("supported_raid_types_per_controller")
+
+    return {
+        "is_vroc_passthrough": nvme_drive_count > 0 and has_no_supported_raid_types,
+        "nvme_drive_count": nvme_drive_count,
+        "total_drive_count": len(drives),
     }
 
 
@@ -314,7 +495,11 @@ def diagnose_action_not_supported(bmc, raid_controller_id, rrl):
     returns a dict pairing the requested RAID level with exactly what
     that controller does support, so the caller can see immediately
     whether e.g. RAID1 is simply not offered by this specific
-    controller/firmware rather than guessing from a bare 405.
+    controller/firmware rather than guessing from a bare 405. Also
+    includes detect_vroc_passthrough()'s result, since an
+    ActionNotSupported failure on an all-NVMe controller with no
+    SupportedRAIDTypes is very likely VROC pass-through mode rather than
+    a plain firmware/endpoint mismatch.
     """
     requested_raid_type = RRL_TO_RAID_TYPE.get(rrl, f"Rrl={rrl}")
     try:
@@ -322,14 +507,28 @@ def diagnose_action_not_supported(bmc, raid_controller_id, rrl):
     except Exception as exc:
         supported = {"error": f"Could not introspect controller actions: {exc}"}
 
+    try:
+        vroc_check = detect_vroc_passthrough(bmc, raid_controller_id)
+    except Exception as exc:
+        vroc_check = {"error": f"Could not check VROC pass-through state: {exc}"}
+
     diagnosis = {
         "requested_raid_type": requested_raid_type,
         "controller": raid_controller_id,
         "controller_capabilities": supported,
+        "vroc_passthrough_check": vroc_check,
     }
     supported_types = supported.get("supported_raid_types_per_controller") or []
     flat_supported = {t for group in supported_types for t in (group or [])}
-    if flat_supported and requested_raid_type not in flat_supported:
+    if vroc_check.get("is_vroc_passthrough"):
+        diagnosis["likely_cause"] = (
+            f"Intel VROC pass-through mode with no recognized license key: "
+            f"{vroc_check['nvme_drive_count']} of {vroc_check['total_drive_count']} "
+            f"drive(s) on this controller are NVMe and it reports no "
+            f"SupportedRAIDTypes at all. This is expected VROC behavior with no "
+            f"key installed, not a request-shape bug — see VrocPassThroughError."
+        )
+    elif flat_supported and requested_raid_type not in flat_supported:
         diagnosis["likely_cause"] = (
             f"{requested_raid_type} is not in this controller's SupportedRAIDTypes "
             f"({sorted(flat_supported)}). This controller/firmware does not offer "
@@ -345,7 +544,8 @@ def diagnose_action_not_supported(bmc, raid_controller_id, rrl):
 
 
 def create_raid_array_safe(bmc, raid_controller_id=None, rrl=2, device_ids=None, strip_size=9,
-                            span_depth=1, vd_name=None, failed_task_uid=None):
+                            span_depth=1, vd_name=None, failed_task_uid=None,
+                            check_vroc_passthrough=True):
     """
     Remediates the "RAID Array Creation: Failed" error end-to-end,
     covering both old and new Intel BMC generations, and gives detailed
@@ -356,24 +556,33 @@ def create_raid_array_safe(bmc, raid_controller_id=None, rrl=2, device_ids=None,
       2. Resolves the actual RAID controller resource ID via
          resolve_raid_controller_id() (tries CANDIDATE_RAID_CONTROLLER_IDS
          if not given explicitly).
-      3. Validates the requested RAID level/drives/span depth against
+      3. If `check_vroc_passthrough` (default), calls
+         detect_vroc_passthrough() BEFORE attempting any create-action
+         variant. If it detects VROC pass-through mode with no license
+         (NVMe drives, no SupportedRAIDTypes), raises VrocPassThroughError
+         immediately instead of burning three request-shape attempts
+         that cannot possibly succeed against a licensing/BIOS-mode
+         limitation. Set this to False only if you've already confirmed
+         out-of-band that VROC licensing is not the issue on this fleet.
+      4. Validates the requested RAID level/drives/span depth against
          live controller state via validate_raid_request(), raising
          ValueError with specifics if anything looks wrong (including a
          RAID1-needs-2-drives check).
-      4. Tries every known create-action shape in order until one
+      5. Tries every known create-action shape in order until one
          succeeds: the Intel OEM StorageLDrive.Create action on the
          controller (current spec), the same action hung off the
          Storage collection root (older firmware), and a plain DMTF
          VolumeCollection POST with RAIDType (generic fallback — this
          is what actually creates RAID1 on controllers that 405 the
-         OEM action).
-      5. If every variant fails AND at least one failure was a
+         OEM action for reasons other than VROC licensing).
+      6. If every variant fails AND at least one failure was a
          RedfishError reporting ActionNotSupported/405, raises
          RuntimeError whose message is enriched with
          diagnose_action_not_supported()'s output (exactly which
-         actions/RAID types the controller supports) appended after the
-         normal try_variants() failure list, instead of a bare
-         "All variants failed" message.
+         actions/RAID types the controller supports, and whether VROC
+         pass-through was detected) appended after the normal
+         try_variants() failure list, instead of a bare "All variants
+         failed" message.
     `device_ids` is a list of integer physical drive IDs to include.
     Returns (label, result) for whichever variant succeeded.
     """
@@ -381,6 +590,15 @@ def create_raid_array_safe(bmc, raid_controller_id=None, rrl=2, device_ids=None,
         clear_stale_task(bmc, failed_task_uid)
 
     resolved_controller_id = resolve_raid_controller_id(bmc, raid_controller_id)
+
+    if check_vroc_passthrough:
+        vroc_check = detect_vroc_passthrough(bmc, resolved_controller_id)
+        if vroc_check["is_vroc_passthrough"]:
+            raise VrocPassThroughError(
+                resolved_controller_id,
+                RRL_TO_RAID_TYPE.get(rrl, f"Rrl={rrl}"),
+                vroc_check["nvme_drive_count"],
+            )
 
     device_ids = device_ids or []
     num_drives = len(device_ids)
@@ -422,11 +640,23 @@ if __name__ == "__main__":
         available = get_available_drive_ids(bmc, resolved_id)
         print("Resolved controller:", resolved_id, "Available drives:", available)
 
-        result = create_raid_array_safe(
-            bmc,
-            raid_controller_id=resolved_id,
-            rrl=1,  # RAID1, to match the "RAID1 creation — HTTP 405 ActionNotSupported" case
-            device_ids=available[:2],
-            failed_task_uid=failed_task_uid,
-        )
-        print("RAID creation result:", result)
+        try:
+            result = create_raid_array_safe(
+                bmc,
+                raid_controller_id=resolved_id,
+                rrl=1,  # RAID1, to match the "RAID1 creation — HTTP 405 ActionNotSupported" case
+                device_ids=available[:2],
+                failed_task_uid=failed_task_uid,
+            )
+            print("RAID creation result:", result)
+        except VrocPassThroughError as vroc_err:
+            # Decision tree per VrocPassThroughError docstring:
+            #   1. VROC key should be installed on this server class -> file a
+            #      hardware/provisioning request, install it, retest Redfish.
+            #   2. Intel SDP is the sanctioned way to create VROC RAID here ->
+            #      integrate that SDP call once its command/API is confirmed.
+            #   3. No RAID is expected on these NVMe drives -> mark skipped.
+            # This sample takes path 3 (mark skipped) as the safe default;
+            # replace with your own escalation logic for paths 1/2.
+            print("RAID creation skipped:", vroc_err.as_skip_reason())
+
