@@ -6,6 +6,54 @@ and, more specifically: "RAID1 creation — HTTP 405 ActionNotSupported"
 resources documented in the Intel Server System Integrated BMC Firmware
 OpenBMC Redfish API Specification and the DMTF Redfish Volume schema.)
 
+=== POLICY: REUSE-FIRST, CREATE-ONLY-IF-PERMITTED, ELSE LEAVE AS-IS ===
+
+Earlier revisions of this module always tried to CREATE a new RAID array
+first. That is the wrong default on Intel platforms, per follow-up
+research (see error.txt): on an Intel M50CYP server, BIOS reported VROC
+in pass-through mode with all NVMe disks listed as "Non-RAID Physical
+Disks" — meaning RAID creation via any Redfish request shape is
+impossible until a VROC license question is answered by
+hardware/provisioning (install a key, use Intel SDP, or accept no RAID
+is expected at all).
+
+This module now implements the opposite default policy, entered through
+ensure_raid_array() (the primary/recommended entry point):
+
+  1. Check whether storage is ALREADY AVAILABLE on this controller
+     (find_existing_volumes()). If any Volume already exists:
+       - REUSE it. Do not attempt to create a new one.
+       - Optionally CLEAN it first (wipe its data in place) — but ONLY if
+         Redfish actually advertises permission to do so, i.e. the
+         volume's own "Actions" property includes the DMTF-standard
+         #Volume.Initialize action. If that action is not advertised,
+         this is a no-op: leave the volume exactly as it is and reuse it
+         uncleaned. Never force a clean/wipe path that Redfish hasn't
+         explicitly offered.
+  2. If NO storage exists yet, check whether Intel actually ALLOWS
+     creating a RAID array on this controller at all
+     (detect_vroc_passthrough(), get_supported_actions()). If creation is
+     not permitted (VROC pass-through with no license, or the controller
+     genuinely has no matching create action), do NOT raise a hard
+     failure — return a "skipped_no_permission" result and leave the
+     controller untouched. This mirrors the third decision branch from
+     error.txt: "If no RAID is expected for these NVMe drives → mark
+     Intel RAID as skipped/not-supported."
+  3. Only if nothing exists AND creation is confirmed permitted does this
+     module actually attempt to build a new RAID array, via the same
+     old/new-firmware fallback chain as before (Intel OEM
+     StorageLDrive.Create, the older collection-root variant, and the
+     DMTF VolumeCollection POST).
+
+The low-level create_raid_array_safe() function (and the VROC/diagnostic
+helpers it uses) is kept for callers who specifically want to attempt
+creation and handle VrocPassThroughError themselves — but
+ensure_raid_array() is the function that should be called by default,
+since it implements the full reuse/skip policy this platform actually
+needs.
+
+=== BACKGROUND: why RAID creation can fail here ===
+
 RAID logical drive creation runs as an asynchronous action
 (StorageLDrive.Create on a Raid_{ID} controller, per spec section
 2.81.6) and can fail for several distinct reasons:
@@ -93,36 +141,17 @@ purchasing decision):
   applies to a given fleet is an OEM/BIOS configuration question, not a
   Redfish one.
 
-practical conclusion for THIS failure: because RAID1 only requires the
-Standard tier (not Premium), if a licensed hardware/software VROC key of
-ANY tier is genuinely installed and BIOS still reports pass-through /
-Non-RAID Physical Disks, that points to the key not being recognized
-(wrong header, BIOS setting not applied, or key not actually present)
-rather than a "need a bigger license" problem — escalate accordingly
-rather than assuming Premium is required for RAID1.
-
-This module inspects/clears failed tasks, validates drive/parameter
-selection against the controller's actual state, and — the key
-addition for the 405 case — on any ActionNotSupported failure,
-immediately GETs the target resource's own "Actions" property and
-@Redfish.ActionInfo (when present), AND checks whether the target drives
-are NVMe with no SupportedRAIDTypes reported (the VROC pass-through
-signature), so the raised error/diagnosis distinguishes "this is a VROC
-licensing/BIOS-mode issue, not a request-shape bug" from a genuine
-firmware-endpoint mismatch, instead of surfacing a bare "405 Client
-Error". When VROC pass-through is detected, this module raises a
-dedicated VrocPassThroughError (see below) rather than exhausting every
-request-shape fallback pointlessly, since no Redfish request shape can
-create a RAID volume while VROC has no recognized license — the decision
-tree for what to do about that (install a key / use Intel SDP / mark
-unsupported) is documented on VrocPassThroughError itself.
-
-For non-NVMe-VROC controllers (traditional HW RAID / MegaRAID-style
-controllers) this module still tries every known controller-ID naming
-and create-action shape (current spec first, then older/alternate
-shapes) via try_variants() from redfish_client, so a fix that works on
-the new fleet automatically falls back to whatever the old fleet
-actually expects, and vice versa.
+practical conclusion: because RAID1 only requires the Standard tier (not
+Premium), if a licensed hardware/software VROC key of ANY tier is
+genuinely installed and BIOS still reports pass-through / Non-RAID
+Physical Disks, that points to the key not being recognized (wrong
+header, BIOS setting not applied, or key not actually present) rather
+than a "need a bigger license" problem — escalate accordingly rather
+than assuming Premium is required for RAID1. Per error.txt, this exact
+question (should a key be installed here, or is Intel SDP the expected
+RAID-creation path, or is no RAID expected at all) is still open with
+hardware/provisioning — until it's answered, ensure_raid_array()'s
+default of "skip gracefully rather than fail" is the correct behavior.
 
 Depends on redfish_client.RedfishClient / RedfishError / try_variants
 for auth, session handling, rich error detail, and the old/new fallback
@@ -144,21 +173,32 @@ VROC_TIER_UNLOCKED_RAID_TYPES = {
     "intel_ssd_only": ["RAID0", "RAID1", "RAID10", "RAID5", "RAID6"],  # Intel-branded SSDs only
 }
 
+# Default number of drives to auto-select for a fresh RAID build when the
+# caller doesn't pass device_ids explicitly. Only covers the simple cases
+# (RAID0/RAID1); RAID5/RAID6/RAID10/etc. require an explicit device_ids
+# list since minimum drive counts and span layout vary by controller.
+_DEFAULT_NUM_DRIVES_FOR_RRL = {
+    0: 2,  # RAID0
+    1: 2,  # RAID1
+}
+
 
 class VrocPassThroughError(RuntimeError):
     """
-    Raised instead of a generic "all variants failed" error when this
-    module detects that a RAID-creation failure is caused by Intel VROC
-    running in pass-through mode with no recognized license (NVMe drives
-    on this controller report Protocol == "NVMe" and the controller
-    itself advertises no SupportedRAIDTypes) — the documented,
-    expected VROC behavior with no key installed, not a bug in any
-    Redfish request shape.
+    Raised by create_raid_array_safe() (the low-level create-only
+    function) when this module detects that a RAID-creation failure is
+    caused by Intel VROC running in pass-through mode with no
+    recognized license (NVMe drives on this controller report
+    Protocol == "NVMe" and the controller itself advertises no
+    SupportedRAIDTypes) — the documented, expected VROC behavior with no
+    key installed, not a bug in any Redfish request shape.
 
-    Catching this specifically (rather than the generic RuntimeError
-    try_variants() raises) lets a caller implement the three-way
-    decision this situation actually requires, matching the escalation
-    already agreed for this platform:
+    ensure_raid_array() (the recommended entry point) catches this
+    itself and converts it into a "skipped_no_permission" result rather
+    than propagating an exception — see that function's docstring. Use
+    this class directly only if you're calling create_raid_array_safe()
+    on its own and want to implement your own handling of the same
+    three-way decision:
 
       1. If a VROC Standard/Premium/Intel-SSD-Only license key SHOULD be
          installed on this server class per your hardware/provisioning
@@ -368,6 +408,82 @@ def detect_vroc_passthrough(bmc, raid_controller_id):
     }
 
 
+def find_existing_volumes(bmc, raid_controller_id):
+    """
+    GET /redfish/v1/Systems/system/Storage/{raid_controller_id}/Volumes,
+    then GET each member, and return the list of Volume resource dicts
+    already configured on this controller (RAID or otherwise — this
+    intentionally does not filter by RAIDType, matching the "it is all
+    storage" reuse policy: any existing configured volume counts as
+    "storage already available").
+
+    This is the check ensure_raid_array() uses to decide whether to
+    reuse existing storage instead of creating something new. Returns an
+    empty list (never raises) if the Volumes collection is missing or
+    unreadable, so callers can treat that the same as "nothing exists
+    yet".
+    """
+    try:
+        controller = bmc.get(f"/redfish/v1/Systems/system/Storage/{raid_controller_id}")
+    except Exception:
+        return []
+    volumes_link = controller.get("Volumes", {}).get("@odata.id")
+    if not volumes_link:
+        return []
+    try:
+        collection = bmc.get(volumes_link)
+    except Exception:
+        return []
+
+    volumes = []
+    for member in collection.get("Members", []):
+        try:
+            volumes.append(bmc.get(member["@odata.id"]))
+        except Exception:
+            continue
+    return volumes
+
+
+def get_volume_actions(volume):
+    """Returns the "Actions" property from an already-fetched Volume resource dict, or {} if absent."""
+    return volume.get("Actions", {}) or {}
+
+
+def clean_existing_volume(bmc, volume, initialize_type="Fast"):
+    """
+    Attempts to wipe an existing volume's data in place before reuse,
+    using the DMTF-standard #Volume.Initialize action — but ONLY if
+    Redfish actually advertises that permission ("if redfish gives that
+    permission"). Checks the volume's own "Actions" property
+    (get_volume_actions()) for "#Volume.Initialize"; if it is not
+    present, this function does nothing destructive and returns
+    {"cleaned": False, ...} — the volume is left exactly as it is
+    ("else leave that") and the caller should still proceed to reuse it
+    uncleaned.
+
+    `initialize_type` is passed as the action's InitializeType parameter.
+    "Fast" (the default) clears volume metadata/RAID state quickly
+    without a full-capacity overwrite; use "Slow"/"SlowOverwrite" (per
+    whatever this controller's own AllowableValues report, if it
+    exposes an @Redfish.ActionInfo for this action) if a full data wipe
+    is actually required before reuse.
+    """
+    actions = get_volume_actions(volume)
+    initialize_action = actions.get("#Volume.Initialize")
+    if not isinstance(initialize_action, dict) or not initialize_action.get("target"):
+        return {
+            "cleaned": False,
+            "reason": "Volume has no #Volume.Initialize action advertised in its Actions property; leaving it as-is.",
+        }
+
+    target = initialize_action["target"]
+    try:
+        result = bmc.post(target, {"InitializeType": initialize_type})
+        return {"cleaned": True, "initialize_type": initialize_type, "result": result}
+    except Exception as exc:
+        return {"cleaned": False, "reason": f"#Volume.Initialize action failed, leaving volume as-is: {exc}"}
+
+
 def validate_raid_request(bmc, raid_controller_id, rrl, num_drives, span_depth, device_ids):
     """
     Cross-checks a proposed RAID creation request against the live
@@ -547,10 +663,17 @@ def create_raid_array_safe(bmc, raid_controller_id=None, rrl=2, device_ids=None,
                             span_depth=1, vd_name=None, failed_task_uid=None,
                             check_vroc_passthrough=True):
     """
-    Remediates the "RAID Array Creation: Failed" error end-to-end,
-    covering both old and new Intel BMC generations, and gives detailed
-    diagnostics specifically for HTTP 405 ActionNotSupported failures
-    (e.g. "RAID1 creation — HTTP 405 ActionNotSupported"):
+    Low-level create-only function: always attempts to build a NEW RAID
+    array, covering both old and new Intel BMC generations, and gives
+    detailed diagnostics specifically for HTTP 405 ActionNotSupported
+    failures (e.g. "RAID1 creation — HTTP 405 ActionNotSupported").
+
+    Most callers should use ensure_raid_array() instead, which checks
+    for existing/reusable storage and creation-permission FIRST and only
+    calls this function when creation is both necessary and confirmed
+    possible. Call this directly only if you specifically want to force
+    a create attempt and handle VrocPassThroughError yourself.
+
       1. If `failed_task_uid` is given (e.g. the uid from error.txt),
          clears it via clear_stale_task() so it can't block the retry.
       2. Resolves the actual RAID controller resource ID via
@@ -563,7 +686,9 @@ def create_raid_array_safe(bmc, raid_controller_id=None, rrl=2, device_ids=None,
          immediately instead of burning three request-shape attempts
          that cannot possibly succeed against a licensing/BIOS-mode
          limitation. Set this to False only if you've already confirmed
-         out-of-band that VROC licensing is not the issue on this fleet.
+         out-of-band that VROC licensing is not the issue on this fleet
+         (ensure_raid_array() does this, since it already ran the same
+         check itself).
       4. Validates the requested RAID level/drives/span depth against
          live controller state via validate_raid_request(), raising
          ValueError with specifics if anything looks wrong (including a
@@ -600,7 +725,15 @@ def create_raid_array_safe(bmc, raid_controller_id=None, rrl=2, device_ids=None,
                 vroc_check["nvme_drive_count"],
             )
 
-    device_ids = device_ids or []
+    if device_ids is None:
+        default_count = _DEFAULT_NUM_DRIVES_FOR_RRL.get(rrl)
+        if default_count is None:
+            raise ValueError(
+                f"device_ids must be given explicitly for Rrl={rrl} "
+                f"(no safe default drive count for this RAID level)"
+            )
+        device_ids = get_available_drive_ids(bmc, resolved_controller_id)[:default_count]
+
     num_drives = len(device_ids)
     problems = validate_raid_request(bmc, resolved_controller_id, rrl, num_drives, span_depth, device_ids)
     if problems:
@@ -623,6 +756,114 @@ def create_raid_array_safe(bmc, raid_controller_id=None, rrl=2, device_ids=None,
         ) from all_failed
 
 
+def ensure_raid_array(bmc, raid_controller_id=None, rrl=2, device_ids=None, strip_size=9,
+                       span_depth=1, vd_name=None, failed_task_uid=None,
+                       clean_before_reuse=True, initialize_type="Fast"):
+    """
+    RECOMMENDED ENTRY POINT. Implements the reuse-first / create-only-
+    if-permitted / else-leave-as-is policy described in this module's
+    docstring:
+
+      1. Resolves the RAID controller (old/new naming fallback).
+      2. Checks whether storage ALREADY EXISTS on it
+         (find_existing_volumes()). If one or more Volumes are already
+         present:
+           - Optionally cleans the first one in place via
+             clean_existing_volume() — only if that volume's own Actions
+             advertise #Volume.Initialize ("if redfish gives that
+             permission"); otherwise the clean step is a no-op and the
+             volume is left exactly as it is ("else leave that").
+           - Returns immediately with action="reused_existing_volume".
+             No creation attempt is made — existing storage always wins.
+      3. If nothing exists yet, checks whether this controller actually
+         PERMITS creating a RAID array at all
+         (detect_vroc_passthrough()). If VROC pass-through with no
+         license is detected, creation is impossible by platform design
+         — returns action="skipped_no_permission" (using
+         VrocPassThroughError.as_skip_reason() as the `reason`) instead
+         of raising. The controller is left untouched.
+      4. Otherwise, attempts to create a new RAID array via
+         create_raid_array_safe() (VROC re-check skipped, since step 3
+         already did it). If every create-action variant still fails
+         with ActionNotSupported for a non-VROC reason (e.g. this
+         specific RAID level just isn't offered by this controller),
+         ALSO returns action="skipped_no_permission" — with
+         diagnose_action_not_supported()'s output attached as `diagnosis`
+         — rather than raising, per the same "if Intel doesn't allow it,
+         leave that" instruction. Any OTHER kind of failure (a
+         ValueError from validate_raid_request — e.g. a genuinely bad
+         drive selection) still propagates, since that is an actionable
+         bug to fix, not a permission boundary.
+
+    Returns a dict with "action" set to one of:
+      "reused_existing_volume" | "created_new_volume" | "skipped_no_permission"
+
+    `device_ids` may be omitted for RAID0/RAID1 (a safe default drive
+    count is auto-selected from currently available drives); it must be
+    given explicitly for RAID5/RAID6/RAID10/etc.
+    """
+    if failed_task_uid:
+        clear_stale_task(bmc, failed_task_uid)
+
+    resolved_controller_id = resolve_raid_controller_id(bmc, raid_controller_id)
+
+    existing_volumes = find_existing_volumes(bmc, resolved_controller_id)
+    if existing_volumes:
+        volume = existing_volumes[0]
+        clean_result = None
+        if clean_before_reuse:
+            clean_result = clean_existing_volume(bmc, volume, initialize_type=initialize_type)
+        return {
+            "action": "reused_existing_volume",
+            "controller": resolved_controller_id,
+            "volume_id": volume.get("@odata.id"),
+            "raid_type": volume.get("RAIDType"),
+            "existing_volume_count": len(existing_volumes),
+            "clean_result": clean_result,
+        }
+
+    vroc_check = detect_vroc_passthrough(bmc, resolved_controller_id)
+    if vroc_check["is_vroc_passthrough"]:
+        skip_err = VrocPassThroughError(
+            resolved_controller_id,
+            RRL_TO_RAID_TYPE.get(rrl, f"Rrl={rrl}"),
+            vroc_check["nvme_drive_count"],
+        )
+        return {
+            "action": "skipped_no_permission",
+            "controller": resolved_controller_id,
+            "reason": skip_err.as_skip_reason(),
+            "detail": str(skip_err),
+        }
+
+    try:
+        label, result = create_raid_array_safe(
+            bmc,
+            raid_controller_id=resolved_controller_id,
+            rrl=rrl,
+            device_ids=device_ids,
+            strip_size=strip_size,
+            span_depth=span_depth,
+            vd_name=vd_name,
+            check_vroc_passthrough=False,  # already checked above
+        )
+        return {
+            "action": "created_new_volume",
+            "controller": resolved_controller_id,
+            "variant": label,
+            "result": result,
+        }
+    except RuntimeError as create_failed:
+        diagnosis = diagnose_action_not_supported(bmc, resolved_controller_id, rrl)
+        return {
+            "action": "skipped_no_permission",
+            "controller": resolved_controller_id,
+            "reason": "intel_raid_skipped_action_not_supported",
+            "detail": str(create_failed),
+            "diagnosis": diagnosis,
+        }
+
+
 if __name__ == "__main__":
     import os
 
@@ -637,26 +878,14 @@ if __name__ == "__main__":
 
     with RedfishClient(host, user, password) as bmc:
         resolved_id = resolve_raid_controller_id(bmc, raid_controller_id)
-        available = get_available_drive_ids(bmc, resolved_id)
-        print("Resolved controller:", resolved_id, "Available drives:", available)
+        print("Resolved controller:", resolved_id)
 
-        try:
-            result = create_raid_array_safe(
-                bmc,
-                raid_controller_id=resolved_id,
-                rrl=1,  # RAID1, to match the "RAID1 creation — HTTP 405 ActionNotSupported" case
-                device_ids=available[:2],
-                failed_task_uid=failed_task_uid,
-            )
-            print("RAID creation result:", result)
-        except VrocPassThroughError as vroc_err:
-            # Decision tree per VrocPassThroughError docstring:
-            #   1. VROC key should be installed on this server class -> file a
-            #      hardware/provisioning request, install it, retest Redfish.
-            #   2. Intel SDP is the sanctioned way to create VROC RAID here ->
-            #      integrate that SDP call once its command/API is confirmed.
-            #   3. No RAID is expected on these NVMe drives -> mark skipped.
-            # This sample takes path 3 (mark skipped) as the safe default;
-            # replace with your own escalation logic for paths 1/2.
-            print("RAID creation skipped:", vroc_err.as_skip_reason())
-
+        # ensure_raid_array() implements reuse-first / create-if-permitted /
+        # else-leave-as-is — this is the recommended way to call this module.
+        result = ensure_raid_array(
+            bmc,
+            raid_controller_id=resolved_id,
+            rrl=1,  # RAID1, to match the "RAID1 creation — HTTP 405 ActionNotSupported" case
+            failed_task_uid=failed_task_uid,
+        )
+        print("ensure_raid_array result:", result)
