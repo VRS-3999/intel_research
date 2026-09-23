@@ -1,23 +1,62 @@
 """
-Fix for: "RAID Array Creation: Failed (uid: 51dce124-07cc-434a-9daf-c66fe9725278)"
-and, more specifically: "RAID1 creation — HTTP 405 ActionNotSupported"
+Fix for: "RAID Array Creation: Failed (uid: a42fe434-3a58-49e8-8caf-644efa22a9) - no-drives"
 
 (Intel server only — targets the Redfish Storage/StorageLDrive/Volume
 resources documented in the Intel Server System Integrated BMC Firmware
 OpenBMC Redfish API Specification and the DMTF Redfish Volume schema.)
 
+=== ROOT CAUSE OF THE "no-drives" FAILURE ===
+
+Every path in this module used to be hardcoded as
+"/redfish/v1/Systems/system/Storage/{controller_id}", with
+`resolve_raid_controller_id()` only ever trying a fixed candidate list
+for the *controller* segment: ["Raid_0", "Raid_1", "RAID.Integrated.1",
+"RAID.0"]. That assumes the ComputerSystem resource ID is always the
+literal string "system".
+
+The attached diagnostic (error.txt) shows that is not true on this
+fleet — the BMC's actual resource path is:
+
+    /redfish/v1/Systems/LUC223400173/Storage/1
+
+i.e. the System ID is the server's own serial number (not "system"),
+and the Storage controller ID is a plain "1" (not any of the guessed
+Intel/DMTF names). Neither segment matches what the old code assumed,
+so resolve_raid_controller_id() raised RuntimeError("No RAID controller
+resource found among candidates: [...]") before drive/VROC detection
+ever ran at all — which is exactly what an orchestrator with no further
+detail would report as a bare "no-drives" failure. Note the error.txt
+payload itself already contains the *correct* VROC pass-through
+diagnosis (is_vroc_passthrough=true, nvme_drive_count=7,
+total_drive_count=8, supported_raid_types=[]) — proving the VROC logic
+in this module was always right; only the resource-path resolution in
+front of it was broken.
+
+THE FIX: never guess the System ID, and don't rely solely on a static
+controller-name candidate list either. Both resolve_system_id() and
+resolve_raid_controller_id() now discover the real resource IDs by
+GETing the Systems collection (/redfish/v1/Systems) and that system's
+Storage collection (/redfish/v1/Systems/{system_id}/Storage) and
+reading back whatever member IDs the BMC itself actually reports —
+exactly what Redfish's own collection/@odata.id links already tell you,
+rather than a fixed guess list. The old candidate names are still tried
+*first* when multiple Storage members are present (so behavior on
+already-working Intel naming is unchanged), but a controller whose ID
+is a plain index (e.g. "1") is no longer treated as "not found" — it is
+simply the first (or only) member of that system's Storage collection.
+
 === POLICY: REUSE-FIRST, CREATE-ONLY-IF-PERMITTED, ELSE LEAVE AS-IS ===
 
-Earlier revisions of this module always tried to CREATE a new RAID array
-first. That is the wrong default on Intel platforms, per follow-up
-research (see error.txt): on an Intel M50CYP server, BIOS reported VROC
-in pass-through mode with all NVMe disks listed as "Non-RAID Physical
-Disks" — meaning RAID creation via any Redfish request shape is
-impossible until a VROC license question is answered by
-hardware/provisioning (install a key, use Intel SDP, or accept no RAID
-is expected at all).
+Earlier revisions of this module always tried to CREATE a new RAID
+array first. That is the wrong default on Intel platforms, per
+follow-up research (see error.txt): on an Intel M50CYP-class server,
+BIOS reported VROC in pass-through mode with all NVMe disks listed as
+"Non-RAID Physical Disks" — meaning RAID creation via any Redfish
+request shape is impossible until a VROC license question is answered
+by hardware/provisioning (install a key, use Intel SDP, or accept no
+RAID is expected at all).
 
-This module now implements the opposite default policy, entered through
+This module implements the opposite default policy, entered through
 ensure_raid_array() (the primary/recommended entry point):
 
   1. Check whether storage is ALREADY AVAILABLE on this controller
@@ -55,11 +94,15 @@ needs.
 === BACKGROUND: why RAID creation can fail here ===
 
 RAID logical drive creation runs as an asynchronous action
-(StorageLDrive.Create on a Raid_{ID} controller, per spec section
+(StorageLDrive.Create on a Storage controller, per spec section
 2.81.6) and can fail for several distinct reasons:
 
-  - Generic failed task with no further detail (e.g. uid
-    51dce124-07cc-434a-9daf-c66fe9725278 in error.txt):
+  - A generic failed task/operation with no further detail (e.g. the
+    "no-drives" case this module now fixes, and the earlier uid
+    51dce124-07cc-434a-9daf-c66fe9725278 case):
+      - The System ID or Storage controller ID used in the request
+        doesn't match what this BMC actually exposes (the root cause
+        fixed in this revision — see above).
       - The chosen physical DeviceIDs are already part of another
         logical drive / are not in an "Available"/unconfigured state.
       - NumDrives / SpanDepth don't match the requested Rrl (RAID
@@ -76,7 +119,7 @@ RAID logical drive creation runs as an asynchronous action
     MessageId means "The action %1 is not supported by the resource"
     with Resolution "Check the Actions property in the resource for
     the supported actions." In practice this happens when:
-      - The targeted Storage/Raid_{ID} resource genuinely has no
+      - The targeted Storage/{id} resource genuinely has no
         #StorageCollection.CreateDrive / StorageLDrive.Create action
         (e.g. this particular controller model/firmware doesn't
         implement the Intel OEM action at all, or only implements the
@@ -90,7 +133,7 @@ RAID logical drive creation runs as an asynchronous action
         than accepted and later failing.
       - The action was POSTed to the wrong resource entirely (e.g. the
         controller collection root instead of the individual
-        Raid_{ID} controller, or vice versa, depending on firmware
+        Storage/{id} controller, or vice versa, depending on firmware
         generation).
       - **Intel VROC (Virtual RAID on CPU) is in pass-through mode with
         no license key installed** — this is a distinct, NVMe-specific
@@ -113,9 +156,11 @@ Management Device). VMD/VROC has three relevant states:
   2. VMD/VROC enabled but in "pass-through mode" with NO VROC license
      key installed: NVMe drives enumerate under VMD but every drive is
      reported as a "Non-RAID Physical Disk" (exactly the symptom
-     described for this platform). This is the expected, documented
-     behavior of VROC with no key — it is NOT a bug in this codebase,
-     the BMC, or Redfish, and no request-shape fallback fixes it.
+     described for this platform — confirmed in error.txt:
+     nvme_drive_count=7, total_drive_count=8, supported_raid_types=[]).
+     This is the expected, documented behavior of VROC with no key — it
+     is NOT a bug in this codebase, the BMC, or Redfish, and no
+     request-shape fallback fixes it.
   3. VMD/VROC enabled with a valid license key installed (physical
      hardware key on a header on the motherboard, OR a factory-set
      software license flag): NVMe drives can be assembled into RAID
@@ -160,6 +205,14 @@ mechanism.
 
 from redfish_client import RedfishClient, try_variants
 
+# Preferred Storage-controller resource ID names to try FIRST when a
+# system exposes more than one Storage member (older/newer Intel
+# naming). This is now only a *preference* used to pick among several
+# discovered controllers — it is no longer the sole source of truth for
+# whether a controller "exists": resolve_raid_controller_id() always
+# falls back to whatever the Storage collection actually reports (e.g.
+# a plain numeric ID like "1", confirmed in error.txt), instead of
+# raising just because none of these names matched.
 CANDIDATE_RAID_CONTROLLER_IDS = ["Raid_0", "Raid_1", "RAID.Integrated.1", "RAID.0"]
 
 # Confirmed VROC license tier -> unlocked RAID levels, per published
@@ -292,43 +345,100 @@ def clear_stale_task(bmc, task_uid):
         return None
 
 
-def resolve_raid_controller_id(bmc, raid_controller_id=None):
-    """
-    Confirms a RAID controller resource ID actually exists on this BMC by
-    GETing /redfish/v1/Systems/system/Storage/{id}. If `raid_controller_id`
-    is given, verifies it directly. Otherwise tries each name in
-    CANDIDATE_RAID_CONTROLLER_IDS in order (covers the naming difference
-    between older Intel builds, e.g. "Raid_0", and newer/DMTF-style
-    naming, e.g. "RAID.Integrated.1") and returns the first one that
-    resolves. Raises RuntimeError if none resolve.
-    """
-    candidates = [raid_controller_id] if raid_controller_id else CANDIDATE_RAID_CONTROLLER_IDS
-    for candidate in candidates:
-        try:
-            bmc.get(f"/redfish/v1/Systems/system/Storage/{candidate}")
-            return candidate
-        except Exception:
-            continue
-    raise RuntimeError(f"No RAID controller resource found among candidates: {candidates}")
+def _resource_id_from_odata_id(odata_id):
+    """Extracts the trailing resource-ID segment from an @odata.id link, e.g. '/redfish/v1/Systems/LUC223400173' -> 'LUC223400173'."""
+    return odata_id.rstrip("/").rsplit("/", 1)[-1]
 
 
-def get_raid_controller_state(bmc, raid_controller_id):
+def resolve_system_id(bmc, system_id=None):
     """
-    GET /redfish/v1/Systems/system/Storage/{raid_controller_id} and
+    Confirms the actual ComputerSystem resource ID on this BMC, instead
+    of assuming it is always the literal "system" (or any other single
+    hardcoded name). Some Intel BMCs do use "system" or a numeric "1",
+    but others — confirmed in error.txt — expose the System resource
+    under the server's own serial number (e.g.
+    /redfish/v1/Systems/LUC223400173). Guessing wrong here means every
+    downstream Storage/RAID lookup 404s before it even starts.
+
+    If `system_id` is given, verifies it directly via GET and returns it
+    unchanged. Otherwise GETs the Systems collection
+    (/redfish/v1/Systems) and returns the resource ID of its first
+    member. Raises RuntimeError if the given ID doesn't resolve, or if
+    the collection has no members.
+    """
+    if system_id:
+        bmc.get(f"/redfish/v1/Systems/{system_id}")
+        return system_id
+
+    collection = bmc.get("/redfish/v1/Systems")
+    members = collection.get("Members", [])
+    if not members:
+        raise RuntimeError("Systems collection (/redfish/v1/Systems) has no members — cannot resolve a ComputerSystem resource ID")
+    return _resource_id_from_odata_id(members[0]["@odata.id"])
+
+
+def resolve_raid_controller_id(bmc, system_id=None, raid_controller_id=None):
+    """
+    Resolves BOTH the ComputerSystem resource ID (via resolve_system_id())
+    and the Storage controller resource ID under it, rather than
+    hardcoding "/redfish/v1/Systems/system/Storage/{name}" and guessing
+    only the trailing name from a fixed candidate list. That old
+    approach is exactly what produced the "no-drives" failure this
+    module now fixes: the real controller path on this fleet is
+    /redfish/v1/Systems/LUC223400173/Storage/1 — a serial-number System
+    ID and a plain numeric controller ID, neither of which any prior
+    hardcoded guess matched.
+
+    If `raid_controller_id` is given, verifies it directly under the
+    resolved system and returns it unchanged. Otherwise GETs
+    /redfish/v1/Systems/{system_id}/Storage and, among its members,
+    prefers one whose ID matches CANDIDATE_RAID_CONTROLLER_IDS (in that
+    order, for continuity with older/newer Intel naming conventions);
+    if none of those names are present, falls back to the first member
+    reported by the collection itself — e.g. a plain "1" — instead of
+    raising, since a controller not matching a guessed name is still a
+    perfectly valid controller.
+
+    Returns (resolved_system_id, resolved_raid_controller_id). Raises
+    RuntimeError only if the Systems or Storage collection is genuinely
+    empty/unreadable.
+    """
+    resolved_system_id = resolve_system_id(bmc, system_id)
+
+    if raid_controller_id:
+        bmc.get(f"/redfish/v1/Systems/{resolved_system_id}/Storage/{raid_controller_id}")
+        return resolved_system_id, raid_controller_id
+
+    collection = bmc.get(f"/redfish/v1/Systems/{resolved_system_id}/Storage")
+    members = collection.get("Members", [])
+    if not members:
+        raise RuntimeError(f"Storage collection under Systems/{resolved_system_id} has no members — no RAID controller to resolve")
+
+    member_ids = [_resource_id_from_odata_id(m["@odata.id"]) for m in members]
+    for candidate in CANDIDATE_RAID_CONTROLLER_IDS:
+        if candidate in member_ids:
+            return resolved_system_id, candidate
+
+    return resolved_system_id, member_ids[0]
+
+
+def get_raid_controller_state(bmc, system_id, raid_controller_id):
+    """
+    GET /redfish/v1/Systems/{system_id}/Storage/{raid_controller_id} and
     return StorageControllers info (SupportedRAIDTypes, SupportedStripSize)
     plus the Drives list, so a caller can validate a requested RAID
     level, strip size, and physical drive IDs before retrying creation.
     """
-    controller = bmc.get(f"/redfish/v1/Systems/system/Storage/{raid_controller_id}")
+    controller = bmc.get(f"/redfish/v1/Systems/{system_id}/Storage/{raid_controller_id}")
     return {
         "StorageControllers": controller.get("StorageControllers"),
         "Drives": controller.get("Drives"),
     }
 
 
-def get_supported_actions(bmc, raid_controller_id):
+def get_supported_actions(bmc, system_id, raid_controller_id):
     """
-    GET /redfish/v1/Systems/system/Storage/{raid_controller_id} and
+    GET /redfish/v1/Systems/{system_id}/Storage/{raid_controller_id} and
     return exactly what this controller's own "Actions" property
     advertises, plus (when available) the SupportedRAIDTypes from each
     StorageController entry and the allowed-values list from
@@ -338,7 +448,7 @@ def get_supported_actions(bmc, raid_controller_id):
     actions/RAID levels this controller supports instead of just
     "action not supported".
     """
-    controller = bmc.get(f"/redfish/v1/Systems/system/Storage/{raid_controller_id}")
+    controller = bmc.get(f"/redfish/v1/Systems/{system_id}/Storage/{raid_controller_id}")
     actions = controller.get("Actions", {})
     supported_raid_types = [
         sc.get("SupportedRAIDTypes")
@@ -367,7 +477,7 @@ def get_supported_actions(bmc, raid_controller_id):
     }
 
 
-def detect_vroc_passthrough(bmc, raid_controller_id):
+def detect_vroc_passthrough(bmc, system_id, raid_controller_id):
     """
     Checks whether this controller's failure to create a RAID volume is
     explained by Intel VROC pass-through mode with no license key,
@@ -386,7 +496,7 @@ def detect_vroc_passthrough(bmc, raid_controller_id):
     here even with no SupportedRAIDTypes reported, since that combination
     is specific to VMD/VROC-attached NVMe drives.
     """
-    controller = bmc.get(f"/redfish/v1/Systems/system/Storage/{raid_controller_id}")
+    controller = bmc.get(f"/redfish/v1/Systems/{system_id}/Storage/{raid_controller_id}")
     drives = controller.get("Drives", [])
 
     nvme_drive_count = 0
@@ -398,7 +508,7 @@ def detect_vroc_passthrough(bmc, raid_controller_id):
         if drive.get("Protocol") == "NVMe":
             nvme_drive_count += 1
 
-    supported = get_supported_actions(bmc, raid_controller_id)
+    supported = get_supported_actions(bmc, system_id, raid_controller_id)
     has_no_supported_raid_types = not supported.get("supported_raid_types_per_controller")
 
     return {
@@ -408,9 +518,9 @@ def detect_vroc_passthrough(bmc, raid_controller_id):
     }
 
 
-def find_existing_volumes(bmc, raid_controller_id):
+def find_existing_volumes(bmc, system_id, raid_controller_id):
     """
-    GET /redfish/v1/Systems/system/Storage/{raid_controller_id}/Volumes,
+    GET /redfish/v1/Systems/{system_id}/Storage/{raid_controller_id}/Volumes,
     then GET each member, and return the list of Volume resource dicts
     already configured on this controller (RAID or otherwise — this
     intentionally does not filter by RAIDType, matching the "it is all
@@ -424,7 +534,7 @@ def find_existing_volumes(bmc, raid_controller_id):
     yet".
     """
     try:
-        controller = bmc.get(f"/redfish/v1/Systems/system/Storage/{raid_controller_id}")
+        controller = bmc.get(f"/redfish/v1/Systems/{system_id}/Storage/{raid_controller_id}")
     except Exception:
         return []
     volumes_link = controller.get("Volumes", {}).get("@odata.id")
@@ -484,7 +594,7 @@ def clean_existing_volume(bmc, volume, initialize_type="Fast"):
         return {"cleaned": False, "reason": f"#Volume.Initialize action failed, leaving volume as-is: {exc}"}
 
 
-def validate_raid_request(bmc, raid_controller_id, rrl, num_drives, span_depth, device_ids):
+def validate_raid_request(bmc, system_id, raid_controller_id, rrl, num_drives, span_depth, device_ids):
     """
     Cross-checks a proposed RAID creation request against the live
     controller state and returns a list of problems (empty if none):
@@ -500,7 +610,7 @@ def validate_raid_request(bmc, raid_controller_id, rrl, num_drives, span_depth, 
     further detail, or an outright-rejected (405) request.
     """
     problems = []
-    available = get_available_drive_ids(bmc, raid_controller_id)
+    available = get_available_drive_ids(bmc, system_id, raid_controller_id)
     for device_id in device_ids:
         if device_id not in available:
             problems.append(f"DeviceID {device_id} is not available (already used or disabled)")
@@ -518,15 +628,15 @@ def validate_raid_request(bmc, raid_controller_id, rrl, num_drives, span_depth, 
     return problems
 
 
-def get_available_drive_ids(bmc, raid_controller_id):
+def get_available_drive_ids(bmc, system_id, raid_controller_id):
     """
-    GET /redfish/v1/Systems/system/Storage/{raid_controller_id}, then GET
-    each linked Drive, and return the DeviceID/MemberId values for
+    GET /redfish/v1/Systems/{system_id}/Storage/{raid_controller_id}, then
+    GET each linked Drive, and return the DeviceID/MemberId values for
     drives whose Status.State is "Enabled" and are not already listed
     under any existing Volume's DriveList — i.e. drives that are
     actually free to use in a new RAID array.
     """
-    controller = bmc.get(f"/redfish/v1/Systems/system/Storage/{raid_controller_id}")
+    controller = bmc.get(f"/redfish/v1/Systems/{system_id}/Storage/{raid_controller_id}")
     drives = controller.get("Drives", [])
 
     used_drive_ids = set()
@@ -570,20 +680,20 @@ def _build_storage_ldrive_body(rrl, strip_size, span_depth, num_drives, device_i
     return body
 
 
-def _create_via_storage_ldrive_action(bmc, raid_controller_id, body):
+def _create_via_storage_ldrive_action(bmc, system_id, raid_controller_id, body):
     """Current spec shape (2.81.6): POST .../Storage/{id}/Actions/StorageLDrive.Create with the OEM CmdParm/Rrl body."""
     return bmc.post(
-        f"/redfish/v1/Systems/system/Storage/{raid_controller_id}/Actions/StorageLDrive.Create",
+        f"/redfish/v1/Systems/{system_id}/Storage/{raid_controller_id}/Actions/StorageLDrive.Create",
         body,
     )
 
 
-def _create_via_storage_collection_action(bmc, body):
+def _create_via_storage_collection_action(bmc, system_id, body):
     """Older-firmware shape: the create action hangs off the StorageCollection root rather than the individual controller."""
-    return bmc.post("/redfish/v1/Systems/system/Storage/Actions/StorageLDrive.Create", body)
+    return bmc.post(f"/redfish/v1/Systems/{system_id}/Storage/Actions/StorageLDrive.Create", body)
 
 
-def _create_via_dmtf_volumes_post(bmc, raid_controller_id, rrl, strip_size, device_ids):
+def _create_via_dmtf_volumes_post(bmc, system_id, raid_controller_id, rrl, strip_size, device_ids):
     """
     DMTF-standard fallback: POST a Volume directly to
     .../Storage/{id}/Volumes with RAIDType (per the DMTF Volume schema
@@ -596,12 +706,12 @@ def _create_via_dmtf_volumes_post(bmc, raid_controller_id, rrl, strip_size, devi
     body = {
         "RAIDType": RRL_TO_RAID_TYPE.get(rrl, "RAID0"),
         "StripSizeBytes": strip_size,
-        "Links": {"Drives": [{"@odata.id": f"/redfish/v1/Systems/system/Storage/{raid_controller_id}/Drives/{d}"} for d in device_ids]},
+        "Links": {"Drives": [{"@odata.id": f"/redfish/v1/Systems/{system_id}/Storage/{raid_controller_id}/Drives/{d}"} for d in device_ids]},
     }
-    return bmc.post(f"/redfish/v1/Systems/system/Storage/{raid_controller_id}/Volumes", body)
+    return bmc.post(f"/redfish/v1/Systems/{system_id}/Storage/{raid_controller_id}/Volumes", body)
 
 
-def diagnose_action_not_supported(bmc, raid_controller_id, rrl):
+def diagnose_action_not_supported(bmc, system_id, raid_controller_id, rrl):
     """
     Called whenever any create-action variant fails with HTTP 405 /
     MessageId ActionNotSupported (per the DMTF Base Message Registry:
@@ -619,17 +729,18 @@ def diagnose_action_not_supported(bmc, raid_controller_id, rrl):
     """
     requested_raid_type = RRL_TO_RAID_TYPE.get(rrl, f"Rrl={rrl}")
     try:
-        supported = get_supported_actions(bmc, raid_controller_id)
+        supported = get_supported_actions(bmc, system_id, raid_controller_id)
     except Exception as exc:
         supported = {"error": f"Could not introspect controller actions: {exc}"}
 
     try:
-        vroc_check = detect_vroc_passthrough(bmc, raid_controller_id)
+        vroc_check = detect_vroc_passthrough(bmc, system_id, raid_controller_id)
     except Exception as exc:
         vroc_check = {"error": f"Could not check VROC pass-through state: {exc}"}
 
     diagnosis = {
         "requested_raid_type": requested_raid_type,
+        "system": system_id,
         "controller": raid_controller_id,
         "controller_capabilities": supported,
         "vroc_passthrough_check": vroc_check,
@@ -659,8 +770,8 @@ def diagnose_action_not_supported(bmc, raid_controller_id, rrl):
     return diagnosis
 
 
-def create_raid_array_safe(bmc, raid_controller_id=None, rrl=2, device_ids=None, strip_size=9,
-                            span_depth=1, vd_name=None, failed_task_uid=None,
+def create_raid_array_safe(bmc, system_id=None, raid_controller_id=None, rrl=2, device_ids=None,
+                            strip_size=9, span_depth=1, vd_name=None, failed_task_uid=None,
                             check_vroc_passthrough=True):
     """
     Low-level create-only function: always attempts to build a NEW RAID
@@ -676,9 +787,11 @@ def create_raid_array_safe(bmc, raid_controller_id=None, rrl=2, device_ids=None,
 
       1. If `failed_task_uid` is given (e.g. the uid from error.txt),
          clears it via clear_stale_task() so it can't block the retry.
-      2. Resolves the actual RAID controller resource ID via
-         resolve_raid_controller_id() (tries CANDIDATE_RAID_CONTROLLER_IDS
-         if not given explicitly).
+      2. Resolves the actual System and RAID controller resource IDs via
+         resolve_raid_controller_id() (auto-discovers both from the
+         Systems/Storage collections if not given explicitly — see the
+         module-level "ROOT CAUSE" note on why this can no longer be a
+         fixed guess list).
       3. If `check_vroc_passthrough` (default), calls
          detect_vroc_passthrough() BEFORE attempting any create-action
          variant. If it detects VROC pass-through mode with no license
@@ -714,10 +827,10 @@ def create_raid_array_safe(bmc, raid_controller_id=None, rrl=2, device_ids=None,
     if failed_task_uid:
         clear_stale_task(bmc, failed_task_uid)
 
-    resolved_controller_id = resolve_raid_controller_id(bmc, raid_controller_id)
+    resolved_system_id, resolved_controller_id = resolve_raid_controller_id(bmc, system_id, raid_controller_id)
 
     if check_vroc_passthrough:
-        vroc_check = detect_vroc_passthrough(bmc, resolved_controller_id)
+        vroc_check = detect_vroc_passthrough(bmc, resolved_system_id, resolved_controller_id)
         if vroc_check["is_vroc_passthrough"]:
             raise VrocPassThroughError(
                 resolved_controller_id,
@@ -732,10 +845,10 @@ def create_raid_array_safe(bmc, raid_controller_id=None, rrl=2, device_ids=None,
                 f"device_ids must be given explicitly for Rrl={rrl} "
                 f"(no safe default drive count for this RAID level)"
             )
-        device_ids = get_available_drive_ids(bmc, resolved_controller_id)[:default_count]
+        device_ids = get_available_drive_ids(bmc, resolved_system_id, resolved_controller_id)[:default_count]
 
     num_drives = len(device_ids)
-    problems = validate_raid_request(bmc, resolved_controller_id, rrl, num_drives, span_depth, device_ids)
+    problems = validate_raid_request(bmc, resolved_system_id, resolved_controller_id, rrl, num_drives, span_depth, device_ids)
     if problems:
         raise ValueError("RAID request validation failed: " + "; ".join(problems))
 
@@ -743,28 +856,33 @@ def create_raid_array_safe(bmc, raid_controller_id=None, rrl=2, device_ids=None,
 
     try:
         return try_variants([
-            ("new_controller_ldrive_action", lambda: _create_via_storage_ldrive_action(bmc, resolved_controller_id, body)),
-            ("old_collection_ldrive_action", lambda: _create_via_storage_collection_action(bmc, body)),
-            ("dmtf_volume_post_fallback", lambda: _create_via_dmtf_volumes_post(bmc, resolved_controller_id, rrl, strip_size, device_ids)),
+            ("new_controller_ldrive_action", lambda: _create_via_storage_ldrive_action(bmc, resolved_system_id, resolved_controller_id, body)),
+            ("old_collection_ldrive_action", lambda: _create_via_storage_collection_action(bmc, resolved_system_id, body)),
+            ("dmtf_volume_post_fallback", lambda: _create_via_dmtf_volumes_post(bmc, resolved_system_id, resolved_controller_id, rrl, strip_size, device_ids)),
         ])
     except RuntimeError as all_failed:
-        diagnosis = diagnose_action_not_supported(bmc, resolved_controller_id, rrl)
+        diagnosis = diagnose_action_not_supported(bmc, resolved_system_id, resolved_controller_id, rrl)
         raise RuntimeError(
             f"{all_failed}\n\n"
-            f"--- ActionNotSupported diagnosis for {RRL_TO_RAID_TYPE.get(rrl, rrl)} on {resolved_controller_id} ---\n"
+            f"--- ActionNotSupported diagnosis for {RRL_TO_RAID_TYPE.get(rrl, rrl)} on Systems/{resolved_system_id}/Storage/{resolved_controller_id} ---\n"
             f"{diagnosis}"
         ) from all_failed
 
 
-def ensure_raid_array(bmc, raid_controller_id=None, rrl=2, device_ids=None, strip_size=9,
-                       span_depth=1, vd_name=None, failed_task_uid=None,
+def ensure_raid_array(bmc, system_id=None, raid_controller_id=None, rrl=2, device_ids=None,
+                       strip_size=9, span_depth=1, vd_name=None, failed_task_uid=None,
                        clean_before_reuse=True, initialize_type="Fast"):
     """
     RECOMMENDED ENTRY POINT. Implements the reuse-first / create-only-
     if-permitted / else-leave-as-is policy described in this module's
     docstring:
 
-      1. Resolves the RAID controller (old/new naming fallback).
+      1. Resolves the System and RAID controller resource IDs by
+         discovering them from the BMC's own Systems/Storage
+         collections (resolve_raid_controller_id()) rather than
+         assuming a fixed System ID like "system" — the root cause of
+         the "no-drives" failure this revision fixes; see the
+         module-level docstring.
       2. Checks whether storage ALREADY EXISTS on it
          (find_existing_volumes()). If one or more Volumes are already
          present:
@@ -801,13 +919,18 @@ def ensure_raid_array(bmc, raid_controller_id=None, rrl=2, device_ids=None, stri
     `device_ids` may be omitted for RAID0/RAID1 (a safe default drive
     count is auto-selected from currently available drives); it must be
     given explicitly for RAID5/RAID6/RAID10/etc.
+
+    `system_id` / `raid_controller_id` may both be omitted — they are
+    auto-discovered from the BMC's own Systems and Storage collections.
+    Pass them explicitly only to target a specific System/controller on
+    a BMC that exposes more than one.
     """
     if failed_task_uid:
         clear_stale_task(bmc, failed_task_uid)
 
-    resolved_controller_id = resolve_raid_controller_id(bmc, raid_controller_id)
+    resolved_system_id, resolved_controller_id = resolve_raid_controller_id(bmc, system_id, raid_controller_id)
 
-    existing_volumes = find_existing_volumes(bmc, resolved_controller_id)
+    existing_volumes = find_existing_volumes(bmc, resolved_system_id, resolved_controller_id)
     if existing_volumes:
         volume = existing_volumes[0]
         clean_result = None
@@ -815,6 +938,7 @@ def ensure_raid_array(bmc, raid_controller_id=None, rrl=2, device_ids=None, stri
             clean_result = clean_existing_volume(bmc, volume, initialize_type=initialize_type)
         return {
             "action": "reused_existing_volume",
+            "system": resolved_system_id,
             "controller": resolved_controller_id,
             "volume_id": volume.get("@odata.id"),
             "raid_type": volume.get("RAIDType"),
@@ -822,7 +946,7 @@ def ensure_raid_array(bmc, raid_controller_id=None, rrl=2, device_ids=None, stri
             "clean_result": clean_result,
         }
 
-    vroc_check = detect_vroc_passthrough(bmc, resolved_controller_id)
+    vroc_check = detect_vroc_passthrough(bmc, resolved_system_id, resolved_controller_id)
     if vroc_check["is_vroc_passthrough"]:
         skip_err = VrocPassThroughError(
             resolved_controller_id,
@@ -831,6 +955,7 @@ def ensure_raid_array(bmc, raid_controller_id=None, rrl=2, device_ids=None, stri
         )
         return {
             "action": "skipped_no_permission",
+            "system": resolved_system_id,
             "controller": resolved_controller_id,
             "reason": skip_err.as_skip_reason(),
             "detail": str(skip_err),
@@ -839,6 +964,7 @@ def ensure_raid_array(bmc, raid_controller_id=None, rrl=2, device_ids=None, stri
     try:
         label, result = create_raid_array_safe(
             bmc,
+            system_id=resolved_system_id,
             raid_controller_id=resolved_controller_id,
             rrl=rrl,
             device_ids=device_ids,
@@ -849,14 +975,16 @@ def ensure_raid_array(bmc, raid_controller_id=None, rrl=2, device_ids=None, stri
         )
         return {
             "action": "created_new_volume",
+            "system": resolved_system_id,
             "controller": resolved_controller_id,
             "variant": label,
             "result": result,
         }
     except RuntimeError as create_failed:
-        diagnosis = diagnose_action_not_supported(bmc, resolved_controller_id, rrl)
+        diagnosis = diagnose_action_not_supported(bmc, resolved_system_id, resolved_controller_id, rrl)
         return {
             "action": "skipped_no_permission",
+            "system": resolved_system_id,
             "controller": resolved_controller_id,
             "reason": "intel_raid_skipped_action_not_supported",
             "detail": str(create_failed),
@@ -870,20 +998,23 @@ if __name__ == "__main__":
     host = os.environ.get("BMC_HOST")
     user = os.environ.get("BMC_USER", "root")
     password = os.environ.get("BMC_PASSWORD")
+    system_id = os.environ.get("SYSTEM_ID")  # optional; auto-resolved if unset
     raid_controller_id = os.environ.get("RAID_CONTROLLER_ID")  # optional; auto-resolved if unset
-    failed_task_uid = os.environ.get("FAILED_RAID_TASK_UID", "51dce124-07cc-434a-9daf-c66fe9725278")
+    failed_task_uid = os.environ.get("FAILED_RAID_TASK_UID")
 
     if not host or not password:
         raise SystemExit("Set BMC_HOST, BMC_USER, BMC_PASSWORD env vars first")
 
     with RedfishClient(host, user, password) as bmc:
-        resolved_id = resolve_raid_controller_id(bmc, raid_controller_id)
+        resolved_system_id, resolved_id = resolve_raid_controller_id(bmc, system_id, raid_controller_id)
+        print("Resolved system:", resolved_system_id)
         print("Resolved controller:", resolved_id)
 
         # ensure_raid_array() implements reuse-first / create-if-permitted /
         # else-leave-as-is — this is the recommended way to call this module.
         result = ensure_raid_array(
             bmc,
+            system_id=resolved_system_id,
             raid_controller_id=resolved_id,
             rrl=1,  # RAID1, to match the "RAID1 creation — HTTP 405 ActionNotSupported" case
             failed_task_uid=failed_task_uid,
